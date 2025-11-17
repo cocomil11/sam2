@@ -249,6 +249,7 @@ def overlay_masks(
     threshold: float,
     alpha: float,
     bboxes: Optional[Sequence[Sequence[float]]] = None,
+    bbox_obj_ids: Optional[Sequence[int]] = None,
 ) -> np.ndarray:
     output = frame.copy()
     
@@ -301,6 +302,13 @@ def overlay_masks(
     
     # Draw bounding boxes if provided
     if bboxes is not None:
+        # Use provided bbox_obj_ids if available, otherwise try to use obj_ids
+        if bbox_obj_ids is not None:
+            bbox_ids_list = list(bbox_obj_ids)
+        else:
+            # Convert obj_ids to list if it's a tensor or other iterable
+            bbox_ids_list = list(obj_ids) if obj_ids is not None else []
+        
         for idx, bbox in enumerate(bboxes):
             if len(bbox) == 4:
                 x0, y0, x1, y1 = map(int, bbox)
@@ -308,29 +316,35 @@ def overlay_masks(
                 # Draw bounding box with thicker line
                 cv2.rectangle(output, (x0, y0), (x1, y1), color, 3)
                 # Draw label at top-left corner of bbox
-                if idx < len(obj_ids):
-                    label = f"BBox ID: {obj_ids[idx]}"
-                    (text_width, text_height), baseline = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                    )
-                    # Background for bbox label
-                    cv2.rectangle(
-                        output,
-                        (x0, y0 - text_height - 8),
-                        (x0 + text_width + 4, y0),
-                        (0, 0, 0),
-                        -1,
-                    )
-                    cv2.putText(
-                        output,
-                        label,
-                        (x0 + 2, y0 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                        lineType=cv2.LINE_AA,
-                    )
+                # Use obj_id from list if available, otherwise use index-based ID
+                if idx < len(bbox_ids_list):
+                    bbox_obj_id = bbox_ids_list[idx]
+                else:
+                    # Fallback: use index + 1 as ID if we don't have enough obj_ids
+                    bbox_obj_id = idx + 1
+                
+                label = f"BBox ID: {bbox_obj_id}"
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                )
+                # Background for bbox label
+                cv2.rectangle(
+                    output,
+                    (x0, y0 - text_height - 8),
+                    (x0 + text_width + 4, y0),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(
+                    output,
+                    label,
+                    (x0 + 2, y0 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    lineType=cv2.LINE_AA,
+                )
     
     return output
 
@@ -546,6 +560,7 @@ def main() -> None:
             threshold=args.mask_threshold,
             alpha=args.alpha,
             bboxes=bbox_list,
+            bbox_obj_ids=all_obj_ids,
         )
         try:
             frame_queue.put_nowait(vis_frame.copy())
@@ -572,6 +587,7 @@ def main() -> None:
                 threshold=args.mask_threshold,
                 alpha=args.alpha,
                 bboxes=bbox_list,
+                bbox_obj_ids=all_obj_ids,
             )
             cv2.imshow(window_name, vis_frame)
             cv2.waitKey(1)
@@ -628,6 +644,7 @@ def main() -> None:
                     threshold=args.mask_threshold,
                     alpha=args.alpha,
                     bboxes=bbox_list,  # Show initial bboxes for reference
+                    bbox_obj_ids=all_obj_ids,  # Use initial object IDs for bbox labels
                 )
                 frame_counter += 1
                 elapsed = time.time() - start_time
@@ -700,6 +717,7 @@ def main() -> None:
                             threshold=args.mask_threshold,
                             alpha=args.alpha,
                             bboxes=bbox_list,
+                            bbox_obj_ids=all_obj_ids,
                         )
                         if frame_queue is not None:
                             try:

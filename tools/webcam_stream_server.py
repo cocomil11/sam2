@@ -33,19 +33,32 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/video" or self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.end_headers()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+            except (ConnectionResetError, BrokenPipeError, OSError, ConnectionAbortedError):
+                # Client disconnected before we could send headers
+                return
+            
             try:
                 while True:
                     ret, frame = self.cap.read()
                     if not ret:
-                        break
-                    # Encode frame as JPEG
-                    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    if buffer is None:
+                        # Camera read failed, wait a bit and try again
+                        time.sleep(0.1)
                         continue
-                    frame_bytes = buffer.tobytes()
+                    
+                    # Encode frame as JPEG
+                    try:
+                        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if buffer is None:
+                            continue
+                        frame_bytes = buffer.tobytes()
+                    except Exception:
+                        # Encoding failed, skip this frame
+                        continue
+                    
                     # Send frame
                     try:
                         self.wfile.write(b"--frame\r\n")
@@ -55,15 +68,25 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame_bytes)
                         self.wfile.write(b"\r\n")
                         self.wfile.flush()  # Ensure frame is sent
-                    except (ConnectionResetError, BrokenPipeError, OSError):
+                    except (ConnectionResetError, BrokenPipeError, OSError, ConnectionAbortedError):
                         # Client disconnected, which is normal
+                        break
+                    except Exception:
+                        # Any other error, assume client disconnected
                         break
             except (ConnectionResetError, BrokenPipeError, OSError, ConnectionAbortedError):
                 # Client disconnected, which is normal - suppress the error
                 pass
+            except Exception:
+                # Any other error, log it but don't crash
+                pass
         else:
-            self.send_response(404)
-            self.end_headers()
+            try:
+                self.send_response(404)
+                self.end_headers()
+            except Exception:
+                # Client disconnected, ignore
+                pass
 
     def do_HEAD(self):
         if self.path == "/video" or self.path == "/":
@@ -77,8 +100,12 @@ class StreamingHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress default logging for normal requests
         # Only log errors, not normal disconnections
-        if "error" in format.lower() or "exception" in format.lower():
-            super().log_message(format, *args)
+        message = format % args if args else format
+        # Suppress common connection errors that are normal
+        if any(term in message.lower() for term in ["error", "exception", "traceback"]):
+            # But skip connection reset/aborted errors as they're normal
+            if not any(term in message.lower() for term in ["connection reset", "connection aborted", "broken pipe"]):
+                super().log_message(format, *args)
         # Otherwise suppress (normal connection/disconnection)
 
 
@@ -116,6 +143,8 @@ class StreamingServer:
             return create_handler
 
         self.server = HTTPServer(("0.0.0.0", self.port), handler_factory(self.cap))
+        # Allow socket reuse to avoid "Address already in use" errors
+        self.server.allow_reuse_address = True
         # Get the actual IP addresses the server is listening on
         import socket
         hostname = socket.gethostname()
@@ -132,16 +161,28 @@ class StreamingServer:
                 self.server.serve_forever()
             except KeyboardInterrupt:
                 pass
+            except Exception as e:
+                # Log unexpected errors but don't crash
+                print(f"Server error: {e}")
+                print("Server will continue accepting new connections...")
 
-        self.thread = threading.Thread(target=run_server, daemon=True)
+        # Don't use daemon thread - we want the server to keep running
+        self.thread = threading.Thread(target=run_server, daemon=False)
         self.thread.start()
 
     def stop(self):
         """Stop the streaming server."""
         if self.server:
-            self.server.shutdown()
+            try:
+                self.server.shutdown()
+                self.server.server_close()  # Explicitly close the socket
+            except Exception:
+                pass
         if self.cap:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
         print("Streaming server stopped")
 
     def __enter__(self):

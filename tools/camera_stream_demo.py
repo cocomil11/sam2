@@ -20,7 +20,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -76,7 +76,18 @@ def parse_args() -> argparse.Namespace:
         nargs=4,
         type=float,
         metavar=("X0", "Y0", "X1", "Y1"),
-        help="Optional bounding box prompt. If omitted, an ROI selector pops up.",
+        action="append",
+        help=(
+            "Bounding box prompt (repeat flag for multiple objects). "
+            "Format per box: x0 y0 x1 y1 (top-left and bottom-right corners)."
+        ),
+    )
+    parser.add_argument(
+        "--num-objects",
+        type=int,
+        default=1,
+        help="Total number of objects to track (defaults to 1). "
+        "If fewer --bbox flags are provided, the remaining boxes are selected interactively.",
     )
     parser.add_argument(
         "--mask-threshold",
@@ -237,31 +248,90 @@ def overlay_masks(
     mask_logits: torch.Tensor,
     threshold: float,
     alpha: float,
+    bboxes: Optional[Sequence[Sequence[float]]] = None,
 ) -> np.ndarray:
-    if mask_logits is None:
-        return frame
-    mask_probs = format_masks(mask_logits).detach().cpu().numpy()
     output = frame.copy()
-    for idx, obj_id in enumerate(obj_ids):
-        if idx >= mask_probs.shape[0]:
-            break
-        mask = mask_probs[idx] > threshold
-        if not np.any(mask):
-            continue
-        color = np.array(PALETTE[idx % len(PALETTE)], dtype=np.float32)
-        overlay_region = output[mask]
-        blended = (1.0 - alpha) * overlay_region + alpha * color
-        output[mask] = blended
-        cv2.putText(
-            output,
-            f"obj {obj_id}",
-            (10, 30 + idx * 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            lineType=cv2.LINE_AA,
-        )
+    
+    # Draw masks if available
+    if mask_logits is not None:
+        mask_probs = format_masks(mask_logits).detach().cpu().numpy()
+        for idx, obj_id in enumerate(obj_ids):
+            if idx >= mask_probs.shape[0]:
+                break
+            mask = mask_probs[idx] > threshold
+            if not np.any(mask):
+                continue
+            color = np.array(PALETTE[idx % len(PALETTE)], dtype=np.float32)
+            overlay_region = output[mask]
+            blended = (1.0 - alpha) * overlay_region + alpha * color
+            output[mask] = blended
+            
+            # Find centroid of mask for label placement
+            mask_uint8 = (mask * 255).astype(np.uint8)
+            moments = cv2.moments(mask_uint8)
+            if moments["m00"] > 0:
+                cx = int(moments["m10"] / moments["m00"])
+                cy = int(moments["m01"] / moments["m00"])
+            else:
+                cx, cy = 10, 30 + idx * 25
+            
+            # Draw object ID label at mask centroid
+            label = f"Object ID: {obj_id}"
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+            )
+            # Draw background rectangle for text
+            cv2.rectangle(
+                output,
+                (cx - text_width // 2 - 5, cy - text_height - 5),
+                (cx + text_width // 2 + 5, cy + baseline + 5),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.putText(
+                output,
+                label,
+                (cx - text_width // 2, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+    
+    # Draw bounding boxes if provided
+    if bboxes is not None:
+        for idx, bbox in enumerate(bboxes):
+            if len(bbox) == 4:
+                x0, y0, x1, y1 = map(int, bbox)
+                color = tuple(map(int, PALETTE[idx % len(PALETTE)]))
+                # Draw bounding box with thicker line
+                cv2.rectangle(output, (x0, y0), (x1, y1), color, 3)
+                # Draw label at top-left corner of bbox
+                if idx < len(obj_ids):
+                    label = f"BBox ID: {obj_ids[idx]}"
+                    (text_width, text_height), baseline = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    # Background for bbox label
+                    cv2.rectangle(
+                        output,
+                        (x0, y0 - text_height - 8),
+                        (x0 + text_width + 4, y0),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    cv2.putText(
+                        output,
+                        label,
+                        (x0 + 2, y0 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                        lineType=cv2.LINE_AA,
+                    )
+    
     return output
 
 
@@ -270,8 +340,11 @@ def initialize_predictor(
     frame: np.ndarray,
     obj_id: int,
     bbox: Sequence[float],
+    is_first_object: bool = False,
 ):
-    predictor.load_first_frame(frame)
+    if is_first_object:
+        predictor.load_first_frame(frame)
+    
     _, obj_ids, mask_logits = predictor.add_new_prompt(
         frame_idx=0,
         obj_id=obj_id,
@@ -347,12 +420,20 @@ def start_visualization_server(port: int, frame_queue: queue.Queue) -> Tuple[HTT
         return create_handler
 
     server = HTTPServer(("0.0.0.0", port), handler_factory(frame_queue))
+    # Allow socket reuse to avoid "Address already in use" errors
+    server.allow_reuse_address = True
     
     def run_server():
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            # Ensure socket is closed
+            try:
+                server.server_close()
+            except Exception:
+                pass
 
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
@@ -377,7 +458,7 @@ def main() -> None:
     cleanup_vars = {"cap": None, "viewer_server": None, "viewer_thread": None, "gui_available": False}
 
     def cleanup_handler(signum, frame):
-        """Handle Ctrl+C gracefully."""
+        """Handle termination signals gracefully."""
         print("\n\nShutting down gracefully...")
         if cleanup_vars["cap"] is not None:
             try:
@@ -388,6 +469,8 @@ def main() -> None:
             # Shutdown server - this unblocks serve_forever()
             try:
                 cleanup_vars["viewer_server"].shutdown()
+                # Close the socket to release the port immediately
+                cleanup_vars["viewer_server"].server_close()
             except Exception:
                 pass
         if cleanup_vars["gui_available"]:
@@ -399,8 +482,9 @@ def main() -> None:
         os._exit(0)  # Force exit to avoid hanging
 
     # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, cleanup_handler)
-    signal.signal(signal.SIGTERM, cleanup_handler)
+    signal.signal(signal.SIGINT, cleanup_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, cleanup_handler)  # kill command
+    signal.signal(signal.SIGTSTP, cleanup_handler)   # Ctrl+Z (suspend)
 
     predictor = build_sam2_camera_predictor(
         config_file=args.config,
@@ -415,8 +499,37 @@ def main() -> None:
     if not ret:
         raise RuntimeError("Failed to grab the first frame from the stream.")
 
-    bbox = select_or_use_bbox(first_frame, args.bbox)
-    obj_ids, init_mask_logits = initialize_predictor(predictor, first_frame, args.obj_id, bbox)
+    # Prepare bounding boxes / objects
+    provided_bboxes = args.bbox or []
+    num_objects = max(args.num_objects, len(provided_bboxes) or 1)
+
+    bbox_list: List[Sequence[float]] = []
+    all_obj_ids: List[int] = []
+    mask_logits_list: List[torch.Tensor] = []
+
+    for obj_idx in range(num_objects):
+        obj_id = args.obj_id + obj_idx
+        cli_bbox = provided_bboxes[obj_idx] if obj_idx < len(provided_bboxes) else None
+        bbox = select_or_use_bbox(first_frame, cli_bbox)
+        bbox_list.append(bbox)
+
+        print(f"Initializing object {obj_idx + 1} (ID={obj_id}) with bbox: {bbox}")
+        obj_ids, mask_logits = initialize_predictor(
+            predictor,
+            first_frame,
+            obj_id,
+            bbox,
+            is_first_object=(obj_idx == 0),
+        )
+        all_obj_ids.extend(list(obj_ids))
+        if mask_logits is not None:
+            if mask_logits.dim() == 2:
+                mask_logits = mask_logits.unsqueeze(0)
+            mask_logits_list.append(mask_logits)
+
+    init_mask_logits = (
+        torch.cat(mask_logits_list, dim=0) if mask_logits_list else None
+    )
 
     # Setup visualization
     frame_queue = None
@@ -428,10 +541,11 @@ def main() -> None:
         # Put first frame
         vis_frame = overlay_masks(
             first_frame,
-            obj_ids,
+            all_obj_ids,
             init_mask_logits,
             threshold=args.mask_threshold,
             alpha=args.alpha,
+            bboxes=bbox_list,
         )
         try:
             frame_queue.put_nowait(vis_frame.copy())
@@ -453,10 +567,11 @@ def main() -> None:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             vis_frame = overlay_masks(
                 first_frame,
-                obj_ids,
+                all_obj_ids,
                 init_mask_logits,
                 threshold=args.mask_threshold,
                 alpha=args.alpha,
+                bboxes=bbox_list,
             )
             cv2.imshow(window_name, vis_frame)
             cv2.waitKey(1)
@@ -512,6 +627,7 @@ def main() -> None:
                     mask_logits,
                     threshold=args.mask_threshold,
                     alpha=args.alpha,
+                    bboxes=bbox_list,  # Show initial bboxes for reference
                 )
                 frame_counter += 1
                 elapsed = time.time() - start_time
@@ -555,26 +671,45 @@ def main() -> None:
                         break
                     if key == ord("r"):
                         print("Re-initializing with the current frame...")
-                        bbox = select_or_use_bbox(frame, args.bbox)
-                        obj_ids, mask_logits = initialize_predictor(
-                            predictor, frame, args.obj_id, bbox
+                        predictor.reset_state()
+                        mask_logits_list = []
+                        all_obj_ids = []
+                        for idx, bbox in enumerate(bbox_list):
+                            obj_id = args.obj_id + idx
+                            obj_ids, mask_logits_obj = initialize_predictor(
+                                predictor,
+                                frame,
+                                obj_id,
+                                bbox,
+                                is_first_object=(idx == 0),
+                            )
+                            all_obj_ids.extend(list(obj_ids))
+                            if mask_logits_obj is not None:
+                                if mask_logits_obj.dim() == 2:
+                                    mask_logits_obj = mask_logits_obj.unsqueeze(0)
+                                mask_logits_list.append(mask_logits_obj)
+                        mask_logits = (
+                            torch.cat(mask_logits_list, dim=0)
+                            if mask_logits_list
+                            else None
                         )
                         vis_frame = overlay_masks(
                             frame,
-                            obj_ids,
+                            all_obj_ids,
                             mask_logits,
                             threshold=args.mask_threshold,
                             alpha=args.alpha,
+                            bboxes=bbox_list,
                         )
                         if frame_queue is not None:
                             try:
-                                frame_queue.put_nowait(vis_frame)
+                                frame_queue.put_nowait(vis_frame.copy())
                             except queue.Full:
                                 try:
                                     frame_queue.get_nowait()
                                 except queue.Empty:
                                     pass
-                                frame_queue.put_nowait(vis_frame)
+                                frame_queue.put_nowait(vis_frame.copy())
                         if gui_available:
                             cv2.imshow(window_name, vis_frame)
                         frame_counter = 0
@@ -591,7 +726,11 @@ def main() -> None:
         writer.release()
     if cleanup_vars["viewer_server"] is not None:
         print("Shutting down visualization server...")
-        cleanup_vars["viewer_server"].shutdown()
+        try:
+            cleanup_vars["viewer_server"].shutdown()
+            cleanup_vars["viewer_server"].server_close()  # Close socket to release port
+        except Exception:
+            pass
         if cleanup_vars["viewer_thread"] is not None:
             cleanup_vars["viewer_thread"].join(timeout=1.0)
     if cleanup_vars["gui_available"]:

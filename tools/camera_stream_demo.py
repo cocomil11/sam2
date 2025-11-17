@@ -13,7 +13,9 @@ import argparse
 import contextlib
 import os
 import queue
+import signal
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -337,7 +339,7 @@ class VisualizationHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_visualization_server(port: int, frame_queue: queue.Queue) -> HTTPServer:
+def start_visualization_server(port: int, frame_queue: queue.Queue) -> Tuple[HTTPServer, threading.Thread]:
     """Start HTTP server for visualization streaming."""
     def handler_factory(queue):
         def create_handler(*args, **kwargs):
@@ -365,11 +367,40 @@ def start_visualization_server(port: int, frame_queue: queue.Queue) -> HTTPServe
     print(f"  http://localhost:{port}/video")
     print(f"{'='*60}\n")
     
-    return server
+    return server, thread
 
 
 def main() -> None:
     args = parse_args()
+
+    # Global variables for cleanup
+    cleanup_vars = {"cap": None, "viewer_server": None, "viewer_thread": None, "gui_available": False}
+
+    def cleanup_handler(signum, frame):
+        """Handle Ctrl+C gracefully."""
+        print("\n\nShutting down gracefully...")
+        if cleanup_vars["cap"] is not None:
+            try:
+                cleanup_vars["cap"].release()
+            except Exception:
+                pass
+        if cleanup_vars["viewer_server"] is not None:
+            # Shutdown server - this unblocks serve_forever()
+            try:
+                cleanup_vars["viewer_server"].shutdown()
+            except Exception:
+                pass
+        if cleanup_vars["gui_available"]:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        print("Cleanup complete. Exiting.")
+        os._exit(0)  # Force exit to avoid hanging
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
 
     predictor = build_sam2_camera_predictor(
         config_file=args.config,
@@ -379,6 +410,7 @@ def main() -> None:
     )
 
     cap = open_capture(args.source)
+    cleanup_vars["cap"] = cap
     ret, first_frame = cap.read()
     if not ret:
         raise RuntimeError("Failed to grab the first frame from the stream.")
@@ -388,10 +420,11 @@ def main() -> None:
 
     # Setup visualization
     frame_queue = None
-    viewer_server = None
     if args.viewer_port:
         frame_queue = queue.Queue(maxsize=2)  # Keep only latest frame
-        viewer_server = start_visualization_server(args.viewer_port, frame_queue)
+        viewer_server, viewer_thread = start_visualization_server(args.viewer_port, frame_queue)
+        cleanup_vars["viewer_server"] = viewer_server
+        cleanup_vars["viewer_thread"] = viewer_thread
         # Put first frame
         vis_frame = overlay_masks(
             first_frame,
@@ -413,6 +446,7 @@ def main() -> None:
     # Try to open GUI window (may fail in WSL, that's OK)
     window_name = "SAM 2 Camera Predictor"
     gui_available = False
+    cleanup_vars["gui_available"] = False
     should_try_gui = (not args.no_gui) and (os.environ.get("DISPLAY") or os.name == "nt")
     if should_try_gui:
         try:
@@ -427,6 +461,7 @@ def main() -> None:
             cv2.imshow(window_name, vis_frame)
             cv2.waitKey(1)
             gui_available = True
+            cleanup_vars["gui_available"] = True
         except Exception as e:  # noqa: BLE001
             if args.viewer_port:
                 print(f"GUI not available (this is OK): {e}")
@@ -548,10 +583,20 @@ def main() -> None:
                     # In headless mode, check for interrupt
                     time.sleep(0.01)  # Small delay to prevent CPU spinning
 
-    cap.release()
+    # Cleanup
+    print("\nCleaning up...")
+    if cleanup_vars["cap"] is not None:
+        cleanup_vars["cap"].release()
     if writer is not None:
         writer.release()
-    cv2.destroyAllWindows()
+    if cleanup_vars["viewer_server"] is not None:
+        print("Shutting down visualization server...")
+        cleanup_vars["viewer_server"].shutdown()
+        if cleanup_vars["viewer_thread"] is not None:
+            cleanup_vars["viewer_thread"].join(timeout=1.0)
+    if cleanup_vars["gui_available"]:
+        cv2.destroyAllWindows()
+    print("Done.")
 
 
 if __name__ == "__main__":

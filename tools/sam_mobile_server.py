@@ -229,10 +229,18 @@ def overlay_masks_and_bboxes(
     # Draw masks if available
     if mask_logits is not None:
         mask_probs = format_masks(mask_logits).detach().cpu().numpy()
+        frame_h, frame_w = output.shape[:2]
+        
         for idx, obj_id in enumerate(obj_ids):
             if idx >= mask_probs.shape[0]:
                 break
             mask = mask_probs[idx] > threshold
+            
+            # Resize mask to match frame dimensions if needed
+            mask_h, mask_w = mask.shape[:2]
+            if mask_h != frame_h or mask_w != frame_w:
+                mask = cv2.resize(mask.astype(np.uint8), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            
             if not np.any(mask):
                 continue
             color = np.array(PALETTE[idx % len(PALETTE)], dtype=np.float32)
@@ -426,11 +434,12 @@ def initialize_session():
                         mask_logits = mask_logits.unsqueeze(0)
                     mask_logits_list.append(mask_logits)
             
-            # Store session state
+            # Store session state with original object IDs for consistent ID mapping
             session_states[session_id] = {
                 "initialized": True,
                 "frame_count": 0,
                 "initial_frame_shape": [height, width],
+                "original_object_ids": initialized_obj_ids.copy(),  # Store original IDs for consistent mapping
             }
         
         # Extract bounding boxes from masks for response
@@ -542,30 +551,65 @@ def track_frame():
         # Decode image
         frame = decode_image(image_data)
         
+        # Get original object IDs from session state
+        session_state = session_states[session_id]
+        original_object_ids = session_state.get("original_object_ids", [])
+        
         with predictor_lock:
             # Track objects in the new frame
             # The predictor maintains internal state (memory) from previous frames
             # and uses it to track the objects defined during initialization
-            obj_ids, mask_logits = predictor.track(frame)
+            tracked_obj_ids, mask_logits = predictor.track(frame)
             
             # Update session state
             session_states[session_id]["frame_count"] += 1
             frame_index = session_states[session_id]["frame_count"]
         
+        # Map tracked object IDs back to original IDs to maintain consistency
+        # Create a mapping from tracked IDs to their indices in the mask_logits
+        tracked_obj_ids_list = list(tracked_obj_ids)
+        tracked_id_to_index = {obj_id: idx for idx, obj_id in enumerate(tracked_obj_ids_list)}
+        
         # Extract bounding boxes from masks
-        result_bboxes = []
+        extracted_bboxes = []
         if mask_logits is not None:
             mask_probs = format_masks(mask_logits)
-            obj_ids_list = list(obj_ids)
-            
             # Extract bounding boxes using efficient batched function
             extracted_bboxes = extract_bboxes_from_masks(mask_probs, threshold=0.5)
-            
-            for idx, obj_id in enumerate(obj_ids_list):
-                if idx < len(extracted_bboxes):
-                    bbox = extracted_bboxes[idx]
-                    if bbox:
-                        result_bboxes.append(bbox)
+        
+        # Build result with consistent object IDs
+        # For each original object ID, find its bounding box if it's still tracked
+        result_bboxes = []
+        result_object_ids = []
+        
+        for original_obj_id in original_object_ids:
+            if original_obj_id in tracked_id_to_index:
+                # Object is still tracked - get its bounding box
+                idx = tracked_id_to_index[original_obj_id]
+                if idx < len(extracted_bboxes) and extracted_bboxes[idx] is not None:
+                    result_bboxes.append(extracted_bboxes[idx])
+                    result_object_ids.append(original_obj_id)
+                else:
+                    # Object tracked but no valid bounding box - return None
+                    result_bboxes.append(None)
+                    result_object_ids.append(original_obj_id)
+            else:
+                # Object is lost - return None for bounding box but keep the ID
+                result_bboxes.append(None)
+                result_object_ids.append(original_obj_id)
+        
+        # For visualization, we need to create a mask_logits tensor that matches original IDs
+        # This is tricky because mask_logits only has masks for tracked objects
+        # We'll create a mapping for visualization purposes
+        visualization_mask_logits = None
+        visualization_obj_ids = []
+        if mask_logits is not None:
+            # For visualization, only include objects that are actually tracked
+            visualization_obj_ids = tracked_obj_ids_list
+            visualization_mask_logits = mask_logits
+        else:
+            visualization_obj_ids = []
+            visualization_mask_logits = None
         
         # Save analyzed image if enabled
         if args.save_images:
@@ -575,20 +619,24 @@ def track_frame():
                 frame=frame,
                 session_id=session_id,
                 frame_index=frame_index,
-                obj_ids=list(obj_ids),
-                mask_logits=mask_logits,
-                bboxes=result_bboxes,
+                obj_ids=visualization_obj_ids,  # Use tracked IDs for visualization
+                mask_logits=visualization_mask_logits,
+                bboxes=[bbox for bbox in result_bboxes if bbox is not None],  # Only non-None bboxes for visualization
                 output_dir=args.output_dir,
                 threshold=args.mask_threshold,
                 alpha=args.alpha,
                 is_interactive=is_interactive,
             )
         
+        # Convert None to null for JSON (Flask handles this automatically, but be explicit)
+        # Filter out None values or keep them as null - we'll keep them as null to maintain ID consistency
+        response_bboxes = [bbox if bbox is not None else None for bbox in result_bboxes]
+        
         return jsonify({
             "success": True,
             "session_id": session_id,
-            "object_ids": list(obj_ids),
-            "bounding_boxes": result_bboxes,
+            "object_ids": result_object_ids,  # Always return original IDs in order
+            "bounding_boxes": response_bboxes,  # null for lost objects, bbox for tracked objects
             "frame_index": frame_index
         })
     

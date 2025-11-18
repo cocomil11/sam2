@@ -79,10 +79,13 @@ def annotate_frame_interactive(frame: np.ndarray, existing_bboxes: list = None) 
     
     print("\n=== Interactive Annotation Mode ===")
     print("Instructions:")
-    print("  - Press 'a' to add a new bounding box")
+    print("  - Press 'a' to add a new bounding box (you can add multiple boxes)")
     print("  - Press 'd' to delete the last bounding box")
-    print("  - Press 'Enter' or 'Space' to confirm and start tracking")
+    print("  - Press 'Enter' or 'Space' to confirm and start tracking all objects")
     print("  - Press 'q' to quit without starting")
+    print()
+    print("  You can track multiple objects by adding multiple bounding boxes.")
+    print("  Each box will be assigned a unique object ID (1, 2, 3, ...).")
     print()
     
     while True:
@@ -160,11 +163,15 @@ def test_initialize_session(server_url: str, image_path: str = None, frame: np.n
             session_id = "test_session_1"
     
     # Prepare request
+    # Generate object IDs for each bounding box (1, 2, 3, ...)
+    num_bboxes = len(bboxes) if bboxes else 0
+    generated_obj_ids = list(range(1, num_bboxes + 1)) if num_bboxes > 0 else [1]
+    
     payload = {
         "session_id": session_id,
         "image": image_data,
         "bounding_boxes": bboxes or [],
-        "object_ids": [1, 2] if bboxes and len(bboxes) >= 2 else [1]
+        "object_ids": generated_obj_ids
     }
     
     # Send request
@@ -347,14 +354,42 @@ def test_interactive_annotation_and_stream(server_url: str, camera_id: int, fps:
         return False
     
     try:
-        # Step 1: Capture first frame for annotation
+        # Step 1: Capture first frame for annotation (with retake option)
         print("\n--- Step 1: Capturing first frame for annotation ---")
-        ret, first_frame = cap.read()
-        if not ret:
-            print("✗ Failed to read first frame from camera")
-            return False
+        first_frame = None
+        frame_confirmed = False
         
-        print(f"✓ First frame captured: {first_frame.shape[1]}x{first_frame.shape[0]}")
+        while not frame_confirmed:
+            ret, frame = cap.read()
+            if not ret:
+                print("✗ Failed to read frame from camera")
+                return False
+            
+            first_frame = frame.copy()
+            print(f"✓ Frame captured: {first_frame.shape[1]}x{first_frame.shape[0]}")
+            print("\nFrame preview:")
+            print("  - Press 'Enter' or 'Space' to use this frame and proceed to annotation")
+            print("  - Press 'r' to retake/capture a new frame")
+            print("  - Press 'q' to quit")
+            
+            window_name = "First Frame Preview - Press Enter to confirm, 'r' to retake, 'q' to quit"
+            cv2.imshow(window_name, first_frame)
+            
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('\r') or key == ord('\n') or key == ord(' '):  # Enter or Space
+                    cv2.destroyWindow(window_name)
+                    print("✓ Frame confirmed. Proceeding to annotation...")
+                    frame_confirmed = True
+                    break
+                elif key == ord('r'):
+                    cv2.destroyWindow(window_name)
+                    print("  Retaking frame...")
+                    break  # Break inner loop to capture new frame
+                elif key == ord('q'):
+                    cv2.destroyWindow(window_name)
+                    print("\n✗ Cancelled by user")
+                    return False
         
         # Step 2: Interactive annotation
         print("\n--- Step 2: Interactive Annotation ---")

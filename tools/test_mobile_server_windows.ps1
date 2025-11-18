@@ -4,7 +4,6 @@
 param(
     [string]$ImagePath,
     
-    [Parameter(Mandatory=$true)]
     [float[]]$Bbox,
     
     [string]$ServerPort = "8080",
@@ -17,7 +16,9 @@ param(
     
     [float]$Duration = 0,
     
-    [int]$MaxFrames = 0
+    [int]$MaxFrames = 0,
+    
+    [switch]$Interactive
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
@@ -25,22 +26,37 @@ Write-Host "SAM2 Mobile Server Test Client (Windows)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Validate input source
-if ($Camera -lt 0 -and [string]::IsNullOrWhiteSpace($ImagePath)) {
-    Write-Host "ERROR: Either -ImagePath or -Camera must be specified" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
-    Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
-    exit 1
-}
-
-# Validate bbox arguments (must be multiple of 4)
-if ($Bbox.Count -eq 0 -or ($Bbox.Count % 4) -ne 0) {
-    Write-Host "ERROR: Bounding boxes must be provided in groups of 4 (x0, y0, x1, y1)" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
-    Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
-    exit 1
+# Interactive mode validation
+if ($Interactive) {
+    if ($Camera -lt 0) {
+        Write-Host "ERROR: -Interactive mode requires -Camera to be specified" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Usage: .\test_mobile_server_windows.ps1 -Interactive -Camera 0 -Fps 2.0" -ForegroundColor Yellow
+        exit 1
+    }
+    # In interactive mode, bbox is not required (user will annotate)
+} else {
+    # Non-interactive mode: validate input source
+    if ($Camera -lt 0 -and [string]::IsNullOrWhiteSpace($ImagePath)) {
+        Write-Host "ERROR: Either -ImagePath or -Camera must be specified" -ForegroundColor Red
+        Write-Host "       Or use -Interactive mode to annotate interactively" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
+        Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
+        Write-Host "       .\test_mobile_server_windows.ps1 -Interactive -Camera 0 -Fps 2.0" -ForegroundColor Yellow
+        exit 1
+    }
+    
+    # Validate bbox arguments (must be multiple of 4) - only for non-interactive mode
+    if ($Bbox.Count -eq 0 -or ($Bbox.Count % 4) -ne 0) {
+        Write-Host "ERROR: Bounding boxes must be provided in groups of 4 (x0, y0, x1, y1)" -ForegroundColor Red
+        Write-Host "       Or use -Interactive mode to annotate interactively" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
+        Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
+        Write-Host "       .\test_mobile_server_windows.ps1 -Interactive -Camera 0 -Fps 2.0" -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 # Get WSL IP address (the actual WSL VM IP, not Windows host IP)
@@ -112,19 +128,34 @@ try {
     exit 1
 }
 
-# Build bbox arguments
+# Build bbox arguments (only for non-interactive mode)
 $bboxArgs = @()
-for ($i = 0; $i -lt $Bbox.Count; $i += 4) {
-    $bboxArgs += "--bbox"
-    $bboxArgs += $Bbox[$i]
-    $bboxArgs += $Bbox[$i + 1]
-    $bboxArgs += $Bbox[$i + 2]
-    $bboxArgs += $Bbox[$i + 3]
+if (-not $Interactive -and $Bbox.Count -gt 0) {
+    for ($i = 0; $i -lt $Bbox.Count; $i += 4) {
+        $bboxArgs += "--bbox"
+        $bboxArgs += $Bbox[$i]
+        $bboxArgs += $Bbox[$i + 1]
+        $bboxArgs += $Bbox[$i + 2]
+        $bboxArgs += $Bbox[$i + 3]
+    }
 }
 
-# Build streaming arguments if enabled
+# Build streaming arguments
 $streamArgs = @()
-if ($Stream) {
+if ($Interactive) {
+    # Interactive mode always streams
+    $streamArgs += "--fps"
+    $streamArgs += $Fps
+    if ($Duration -gt 0) {
+        $streamArgs += "--duration"
+        $streamArgs += $Duration
+    }
+    if ($MaxFrames -gt 0) {
+        $streamArgs += "--max-frames"
+        $streamArgs += $MaxFrames
+    }
+    $streamArgs += "--interactive"
+} elseif ($Stream) {
     $streamArgs += "--stream"
     $streamArgs += "--fps"
     $streamArgs += $Fps
@@ -140,13 +171,10 @@ if ($Stream) {
 
 Write-Host "Running test client..." -ForegroundColor Yellow
 Write-Host "Server URL: http://${WslIp}:${ServerPort}" -ForegroundColor Cyan
-if ($Camera -ge 0) {
+if ($Interactive) {
+    Write-Host "Mode: Interactive annotation and streaming" -ForegroundColor Cyan
     Write-Host "Source: Camera $Camera" -ForegroundColor Cyan
-} else {
-    Write-Host "Image: $ImagePath" -ForegroundColor Cyan
-}
-if ($Stream) {
-    Write-Host "Mode: Streaming at $Fps FPS" -ForegroundColor Cyan
+    Write-Host "Streaming FPS: $Fps" -ForegroundColor Cyan
     if ($Duration -gt 0) {
         Write-Host "Duration: $Duration seconds" -ForegroundColor Cyan
     }
@@ -154,7 +182,22 @@ if ($Stream) {
         Write-Host "Max frames: $MaxFrames" -ForegroundColor Cyan
     }
 } else {
-    Write-Host "Mode: Single frame test" -ForegroundColor Cyan
+    if ($Camera -ge 0) {
+        Write-Host "Source: Camera $Camera" -ForegroundColor Cyan
+    } else {
+        Write-Host "Image: $ImagePath" -ForegroundColor Cyan
+    }
+    if ($Stream) {
+        Write-Host "Mode: Streaming at $Fps FPS" -ForegroundColor Cyan
+        if ($Duration -gt 0) {
+            Write-Host "Duration: $Duration seconds" -ForegroundColor Cyan
+        }
+        if ($MaxFrames -gt 0) {
+            Write-Host "Max frames: $MaxFrames" -ForegroundColor Cyan
+        }
+    } else {
+        Write-Host "Mode: Single frame test" -ForegroundColor Cyan
+    }
 }
 Write-Host ""
 

@@ -10,6 +10,7 @@ echo.
 REM Check if arguments are provided
 if "%~1"=="" (
     echo Usage: test_mobile_server_windows.bat [--camera 0] [image_path] [bbox1_x0] [bbox1_y0] [bbox1_x1] [bbox1_y1] [--stream] [--fps 2.0] [--duration 10] [--max-frames 20]
+    echo        test_mobile_server_windows.bat --interactive --camera 0 [--fps 2.0] [--duration 10] [--max-frames 20]
     echo.
     echo Example (single frame from image):
     echo   test_mobile_server_windows.bat C:\path\to\image.jpg 100 100 200 200
@@ -17,18 +18,32 @@ if "%~1"=="" (
     echo Example (streaming from camera at 2fps):
     echo   test_mobile_server_windows.bat --camera 0 100 100 200 200 --stream --fps 2.0 --duration 10
     echo.
-    echo Example (streaming from image at 2fps, max 20 frames):
-    echo   test_mobile_server_windows.bat C:\path\to\image.jpg 100 100 200 200 --stream --fps 2.0 --max-frames 20
+    echo Example (interactive annotation mode):
+    echo   test_mobile_server_windows.bat --interactive --camera 0 --fps 2.0
     echo.
     exit /b 1
 )
 
 set IMAGE_PATH=
 set CAMERA_ID=-1
+set INTERACTIVE_MODE=0
 set FIRST_ARG=%~1
 
-REM Check if first argument is --camera
-if "%FIRST_ARG%"=="--camera" (
+REM Check if first argument is --interactive
+if "%FIRST_ARG%"=="--interactive" (
+    set INTERACTIVE_MODE=1
+    shift
+    REM Next argument should be --camera
+    if "%~1"=="--camera" (
+        set CAMERA_ID=%~2
+        shift
+        shift
+    ) else (
+        echo ERROR: --interactive mode requires --camera to be specified
+        echo Usage: test_mobile_server_windows.bat --interactive --camera 0 [--fps 2.0]
+        exit /b 1
+    )
+) else if "%FIRST_ARG%"=="--camera" (
     set CAMERA_ID=%~2
     shift
     shift
@@ -104,19 +119,30 @@ if "%~1"=="--max-frames" (
     shift
     goto :parse_args
 )
-REM Assume it's a bbox coordinate
-set BB_ARGS=%BB_ARGS% --bbox %~1 %~2 %~3 %~4
-shift
-shift
-shift
-shift
-goto :parse_args
+REM Assume it's a bbox coordinate (only for non-interactive mode)
+if "%INTERACTIVE_MODE%"=="0" (
+    set BB_ARGS=%BB_ARGS% --bbox %~1 %~2 %~3 %~4
+    shift
+    shift
+    shift
+    shift
+    goto :parse_args
+) else (
+    REM In interactive mode, unexpected arguments
+    echo WARNING: Unexpected argument in interactive mode: %~1
+    shift
+    goto :parse_args
+)
 :done_parse
 
-if "%BB_ARGS%"=="" (
-    echo ERROR: At least one bounding box is required.
-    echo Usage: test_mobile_server_windows.bat ^<image_path^> x0 y0 x1 y1 [x0 y0 x1 y1 ...] [--stream] [--fps 2.0] [--duration 10] [--max-frames 20]
-    exit /b 1
+REM Validate bbox arguments (only for non-interactive mode)
+if "%INTERACTIVE_MODE%"=="0" (
+    if "%BB_ARGS%"=="" (
+        echo ERROR: At least one bounding box is required.
+        echo Usage: test_mobile_server_windows.bat ^<image_path^> x0 y0 x1 y1 [x0 y0 x1 y1 ...] [--stream] [--fps 2.0] [--duration 10] [--max-frames 20]
+        echo        Or use --interactive mode to annotate interactively
+        exit /b 1
+    )
 )
 
 REM Check if Python is available
@@ -146,29 +172,48 @@ if "%CAMERA_ID%"=="-1" (
 
 echo Running test client...
 echo Server URL: http://%WSL_IP%:8080
-if "%CAMERA_ID%"=="-1" (
-    echo Image: %IMAGE_PATH%
-) else (
+if "%INTERACTIVE_MODE%"=="1" (
+    echo Mode: Interactive annotation and streaming
     echo Camera: %CAMERA_ID%
-)
-if "%STREAM_MODE%"=="1" (
-    echo Mode: Streaming at %FPS% FPS
+    echo Streaming FPS: %FPS%
     if not "%DURATION%"=="" echo Duration: %DURATION% seconds
     if not "%MAX_FRAMES%"=="" echo Max frames: %MAX_FRAMES%
 ) else (
-    echo Mode: Single frame test
+    if "%CAMERA_ID%"=="-1" (
+        echo Image: %IMAGE_PATH%
+    ) else (
+        echo Camera: %CAMERA_ID%
+    )
+    if "%STREAM_MODE%"=="1" (
+        echo Mode: Streaming at %FPS% FPS
+        if not "%DURATION%"=="" echo Duration: %DURATION% seconds
+        if not "%MAX_FRAMES%"=="" echo Max frames: %MAX_FRAMES%
+    ) else (
+        echo Mode: Single frame test
+    )
 )
 echo.
 
 REM Build command arguments
 set CMD_ARGS=--server-url http://%WSL_IP%:8080
-if "%CAMERA_ID%"=="-1" (
-    set CMD_ARGS=%CMD_ARGS% --image "%IMAGE_PATH%"
+if "%INTERACTIVE_MODE%"=="1" (
+    REM Interactive mode: add camera and interactive flag
+    set CMD_ARGS=%CMD_ARGS% --camera %CAMERA_ID% --interactive
+    REM Add streaming parameters
+    set CMD_ARGS=%CMD_ARGS% --fps %FPS%
+    if not "%DURATION%"=="" set CMD_ARGS=%CMD_ARGS% --duration %DURATION%
+    if not "%MAX_FRAMES%"=="" set CMD_ARGS=%CMD_ARGS% --max-frames %MAX_FRAMES%
 ) else (
-    set CMD_ARGS=%CMD_ARGS% --camera %CAMERA_ID%
+    REM Non-interactive mode
+    if "%CAMERA_ID%"=="-1" (
+        set CMD_ARGS=%CMD_ARGS% --image "%IMAGE_PATH%"
+    ) else (
+        set CMD_ARGS=%CMD_ARGS% --camera %CAMERA_ID%
+    )
+    set CMD_ARGS=%CMD_ARGS% %BB_ARGS% %STREAM_ARGS%
 )
 
-python "%TEST_SCRIPT%" %CMD_ARGS% %BB_ARGS% %STREAM_ARGS%
+python "%TEST_SCRIPT%" %CMD_ARGS%
 
 if errorlevel 1 (
     echo.

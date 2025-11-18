@@ -288,9 +288,18 @@ def save_analyzed_image(
     output_dir: str,
     threshold: float = 0.5,
     alpha: float = 0.6,
+    is_interactive: bool = False,
 ):
-    """Save analyzed image with masks and bounding boxes overlaid."""
+    """Save analyzed image with masks and bounding boxes overlaid.
+    
+    Args:
+        is_interactive: If True, saves to a subfolder named after the session_id.
+    """
     try:
+        # Use subfolder for interactive mode - create a directory per session
+        if is_interactive:
+            output_dir = os.path.join(output_dir, session_id)
+        
         # Create output directory
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         
@@ -448,6 +457,8 @@ def initialize_session():
         
         # Save analyzed image if enabled
         if args.save_images:
+            # Check if this is an interactive session (session_id contains "interactive")
+            is_interactive = "interactive" in session_id.lower()
             save_analyzed_image(
                 frame=frame,
                 session_id=session_id,
@@ -458,6 +469,7 @@ def initialize_session():
                 output_dir=args.output_dir,
                 threshold=args.mask_threshold,
                 alpha=args.alpha,
+                is_interactive=is_interactive,
             )
         
         return jsonify({
@@ -555,6 +567,8 @@ def track_frame():
         
         # Save analyzed image if enabled
         if args.save_images:
+            # Check if this is an interactive session (session_id contains "interactive")
+            is_interactive = "interactive" in session_id.lower()
             save_analyzed_image(
                 frame=frame,
                 session_id=session_id,
@@ -565,6 +579,7 @@ def track_frame():
                 output_dir=args.output_dir,
                 threshold=args.mask_threshold,
                 alpha=args.alpha,
+                is_interactive=is_interactive,
             )
         
         return jsonify({

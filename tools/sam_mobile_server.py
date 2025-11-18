@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -706,6 +707,27 @@ def initialize_predictor(args):
     logger.info("SAM2 predictor initialized successfully")
 
 
+def cleanup_output_directory(output_dir: str):
+    """Delete all files and subdirectories in the output directory."""
+    try:
+        output_path = Path(output_dir)
+        if not output_path.exists():
+            return
+        
+        # Delete all files and subdirectories
+        for item in output_path.iterdir():
+            if item.is_file():
+                item.unlink()
+                logger.debug(f"Deleted file: {item}")
+            elif item.is_dir():
+                shutil.rmtree(item)
+                logger.debug(f"Deleted directory: {item}")
+        
+        logger.info(f"Cleaned up output directory: {output_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to clean up output directory {output_dir}: {e}")
+
+
 def main():
     global args
     args = parse_args()
@@ -713,6 +735,8 @@ def main():
     # Create output directory if saving images
     if args.save_images:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        # Clean up existing images before starting
+        cleanup_output_directory(args.output_dir)
         logger.info(f"Image saving enabled. Output directory: {args.output_dir}")
     
     # Initialize predictor

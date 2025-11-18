@@ -2,13 +2,22 @@
 # This script gets the WSL IP address and runs the test client
 
 param(
-    [Parameter(Mandatory=$true)]
     [string]$ImagePath,
     
     [Parameter(Mandatory=$true)]
     [float[]]$Bbox,
     
-    [string]$ServerPort = "8080"
+    [string]$ServerPort = "8080",
+    
+    [int]$Camera = -1,
+    
+    [switch]$Stream,
+    
+    [float]$Fps = 2.0,
+    
+    [float]$Duration = 0,
+    
+    [int]$MaxFrames = 0
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
@@ -16,12 +25,21 @@ Write-Host "SAM2 Mobile Server Test Client (Windows)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
+# Validate input source
+if ($Camera -lt 0 -and [string]::IsNullOrWhiteSpace($ImagePath)) {
+    Write-Host "ERROR: Either -ImagePath or -Camera must be specified" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
+    Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
+    exit 1
+}
+
 # Validate bbox arguments (must be multiple of 4)
 if ($Bbox.Count -eq 0 -or ($Bbox.Count % 4) -ne 0) {
     Write-Host "ERROR: Bounding boxes must be provided in groups of 4 (x0, y0, x1, y1)" -ForegroundColor Red
     Write-Host ""
     Write-Host "Usage: .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200" -ForegroundColor Yellow
-    Write-Host "       .\test_mobile_server_windows.ps1 -ImagePath 'C:\path\to\image.jpg' -Bbox 100,100,200,200,300,300,400,400" -ForegroundColor Yellow
+    Write-Host "       .\test_mobile_server_windows.ps1 -Camera 0 -Bbox 100,100,200,200 -Stream -Fps 2.0" -ForegroundColor Yellow
     exit 1
 }
 
@@ -69,8 +87,8 @@ try {
 Write-Host "WSL IP address: $WslIp" -ForegroundColor Green
 Write-Host ""
 
-# Check if image exists
-if (-not (Test-Path $ImagePath)) {
+# Check if image exists (if using image file)
+if ($Camera -lt 0 -and -not (Test-Path $ImagePath)) {
     Write-Host "ERROR: Image file not found: $ImagePath" -ForegroundColor Red
     exit 1
 }
@@ -104,18 +122,59 @@ for ($i = 0; $i -lt $Bbox.Count; $i += 4) {
     $bboxArgs += $Bbox[$i + 3]
 }
 
+# Build streaming arguments if enabled
+$streamArgs = @()
+if ($Stream) {
+    $streamArgs += "--stream"
+    $streamArgs += "--fps"
+    $streamArgs += $Fps
+    if ($Duration -gt 0) {
+        $streamArgs += "--duration"
+        $streamArgs += $Duration
+    }
+    if ($MaxFrames -gt 0) {
+        $streamArgs += "--max-frames"
+        $streamArgs += $MaxFrames
+    }
+}
+
 Write-Host "Running test client..." -ForegroundColor Yellow
 Write-Host "Server URL: http://${WslIp}:${ServerPort}" -ForegroundColor Cyan
-Write-Host "Image: $ImagePath" -ForegroundColor Cyan
+if ($Camera -ge 0) {
+    Write-Host "Source: Camera $Camera" -ForegroundColor Cyan
+} else {
+    Write-Host "Image: $ImagePath" -ForegroundColor Cyan
+}
+if ($Stream) {
+    Write-Host "Mode: Streaming at $Fps FPS" -ForegroundColor Cyan
+    if ($Duration -gt 0) {
+        Write-Host "Duration: $Duration seconds" -ForegroundColor Cyan
+    }
+    if ($MaxFrames -gt 0) {
+        Write-Host "Max frames: $MaxFrames" -ForegroundColor Cyan
+    }
+} else {
+    Write-Host "Mode: Single frame test" -ForegroundColor Cyan
+}
 Write-Host ""
 
 # Run the test script
 $serverUrl = "http://${WslIp}:${ServerPort}"
 $allArgs = @(
     $TestScript,
-    "--server-url", $serverUrl,
-    "--image", $ImagePath
-) + $bboxArgs
+    "--server-url", $serverUrl
+)
+
+# Add image or camera argument
+if ($Camera -ge 0) {
+    $allArgs += "--camera"
+    $allArgs += $Camera
+} else {
+    $allArgs += "--image"
+    $allArgs += $ImagePath
+}
+
+$allArgs = $allArgs + $bboxArgs + $streamArgs
 
 try {
     python $allArgs

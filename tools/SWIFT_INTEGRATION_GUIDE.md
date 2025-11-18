@@ -18,9 +18,19 @@ The SAM2 Mobile Server provides REST API endpoints for:
 - **Health Check**: Verify server connectivity
 
 ### Server Requirements
-- Server URL: `http://<WSL_IP>:8080` (or your server address)
+- Server URL: `http://<SERVER_IP>:8080` (see [Network Setup Guide](NETWORK_SETUP_GUIDE.md) for details)
 - Content-Type: `application/json`
 - Image Format: Base64-encoded JPEG/PNG
+
+### Important: Network Configuration
+
+**If your server runs in WSL2**, you need to set up port forwarding to access it from other devices. See [NETWORK_SETUP_GUIDE.md](NETWORK_SETUP_GUIDE.md) for detailed instructions.
+
+**Quick Summary:**
+- WSL IP (e.g., `172.21.129.92`) is only accessible from the Windows host
+- Use Windows network IP (e.g., `192.168.1.100`) from other devices
+- Set up port forwarding: Windows IP:8080 → WSL IP:8080
+- Configure Windows Firewall to allow port 8080
 
 ## API Endpoints
 
@@ -76,10 +86,15 @@ The SAM2 Mobile Server provides REST API endpoints for:
   "success": true,
   "session_id": "unique_session_id",
   "object_ids": [1, 2, ...],
-  "bounding_boxes": [[x0, y0, x1, y1], ...],
+  "bounding_boxes": [[x0, y0, x1, y1], null, ...],
   "frame_index": 1
 }
 ```
+
+**Note:** Object IDs are always returned in the same order as initialized, maintaining consistency even when objects are temporarily lost. If an object is lost, its bounding box will be `null`, but the object ID is preserved. This ensures that:
+- Object ID 1 always refers to the same object throughout the session
+- Object ID 2 always refers to the same object throughout the session
+- Lost objects return `null` for their bounding box but keep their ID
 
 ## Swift Implementation
 
@@ -145,7 +160,7 @@ struct TrackResponse: Codable {
     let success: Bool
     let sessionId: String
     let objectIds: [Int]
-    let boundingBoxes: [[Double]]
+    let boundingBoxes: [BoundingBox?]  // Optional - null for lost objects
     let frameIndex: Int
     
     enum CodingKeys: String, CodingKey {
@@ -154,6 +169,36 @@ struct TrackResponse: Codable {
         case objectIds = "object_ids"
         case boundingBoxes = "bounding_boxes"
         case frameIndex = "frame_index"
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        success = try container.decode(Bool.self, forKey: .success)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        objectIds = try container.decode([Int].self, forKey: .objectIds)
+        frameIndex = try container.decode(Int.self, forKey: .frameIndex)
+        
+        // Handle optional bounding boxes (null values)
+        if let bboxArray = try? container.decode([OptionalBoundingBox].self, forKey: .boundingBoxes) {
+            boundingBoxes = bboxArray.map { $0.bbox }
+        } else {
+            boundingBoxes = []
+        }
+    }
+}
+
+// Helper to decode optional bounding boxes
+private struct OptionalBoundingBox: Codable {
+    let bbox: BoundingBox?
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            bbox = nil
+        } else {
+            let array = try container.decode([Double].self)
+            bbox = BoundingBox(from: array)
+        }
     }
 }
 
@@ -459,11 +504,20 @@ class TrackingViewController: UIViewController {
     
     // MARK: - Helper Methods
     private func updateTrackingResults(_ response: TrackResponse) {
-        // Convert bounding boxes to your UI format
-        let boxes = response.boundingBoxes.map { BoundingBox(from: $0) }
+        // Handle tracking results with consistent object IDs
+        // Note: boundingBoxes array may contain nil for lost objects
         
-        // Update your UI with the tracked bounding boxes
-        // For example, draw them on an image view
+        for (index, objectId) in response.objectIds.enumerated() {
+            if let bbox = response.boundingBoxes[index] {
+                // Object is tracked - update UI with bounding box
+                print("Object \(objectId) is at: \(bbox.asArray)")
+                // Draw bounding box on UI
+            } else {
+                // Object is lost - hide or mark as lost
+                print("Object \(objectId) is lost (not tracked in this frame)")
+                // Hide bounding box or show "lost" indicator
+            }
+        }
     }
     
     private func showError(_ message: String) {

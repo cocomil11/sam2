@@ -43,6 +43,11 @@ predictor_lock = threading.Lock()
 session_states: Dict[str, Dict] = {}  # Store session states for tracking across frames
 args = None  # Global args for access in route handlers
 
+# Note: Currently using a single global predictor instance.
+# Each session initialization resets the predictor state via load_first_frame().
+# This means only one active session is supported at a time.
+# For multiple concurrent sessions, we would need separate predictor instances per session.
+
 # Fixed BGR color palette for up to eight objects (same as camera_stream_demo.py)
 PALETTE = (
     (0, 255, 0),      # Green
@@ -319,11 +324,19 @@ def initialize_session():
     """
     Initialize a new tracking session with initial frame and bounding boxes.
     
+    This endpoint:
+    1. Receives the first frame and bounding boxes from the mobile client
+    2. Initializes SAM2 to track the objects defined by the bounding boxes
+    3. Returns the initial segmentation results (masks converted to bounding boxes)
+    
+    IMPORTANT: The bounding boxes are only needed for the FIRST request.
+    Subsequent frames sent via /track will automatically track these objects.
+    
     Request body:
     {
         "session_id": "unique_session_id",
         "image": "base64_encoded_image_or_data_url",
-        "bounding_boxes": [[x0, y0, x1, y1], ...],  # List of bounding boxes
+        "bounding_boxes": [[x0, y0, x1, y1], ...],  # List of bounding boxes (ONLY in first request)
         "object_ids": [1, 2, ...]  # Optional: custom object IDs
     }
     
@@ -332,9 +345,12 @@ def initialize_session():
         "success": true,
         "session_id": "unique_session_id",
         "object_ids": [1, 2, ...],
-        "bounding_boxes": [[x0, y0, x1, y1], ...],
+        "bounding_boxes": [[x0, y0, x1, y1], ...],  # Bounding boxes extracted from segmentation masks
         "frame_shape": [height, width]
     }
+    
+    Note: Currently only one active session is supported at a time.
+    Initializing a new session will reset the tracking state.
     """
     global predictor, session_states
     
@@ -362,10 +378,17 @@ def initialize_session():
         height, width = frame.shape[:2]
         
         with predictor_lock:
+            # Check if this session already exists - if so, reset it first
+            if session_id in session_states:
+                logger.warning(f"Session {session_id} already exists. Resetting predictor state for new initialization.")
+            
             # Initialize predictor with first frame
+            # This resets the predictor state completely (via _init_state())
+            # This means only one active session is supported at a time
             predictor.load_first_frame(frame)
             
             # Initialize objects with bounding boxes
+            # The bounding boxes define what to track in subsequent frames
             initialized_obj_ids = []
             mask_logits_list = []
             
@@ -376,7 +399,8 @@ def initialize_session():
                 # Use provided object ID or generate one
                 obj_id = object_ids[idx] if object_ids and idx < len(object_ids) else (idx + 1)
                 
-                # Add prompt with bounding box
+                # Add prompt with bounding box on frame 0
+                # This tells SAM2 what objects to track in subsequent frames
                 _, obj_ids, mask_logits = predictor.add_new_prompt(
                     frame_idx=0,
                     obj_id=obj_id,
@@ -395,6 +419,7 @@ def initialize_session():
             session_states[session_id] = {
                 "initialized": True,
                 "frame_count": 0,
+                "initial_frame_shape": [height, width],
             }
         
         # Extract bounding boxes from masks for response
@@ -452,21 +477,29 @@ def initialize_session():
 def track_frame():
     global args
     """
-    Track objects in a new frame.
+    Track objects in a new frame from the video stream.
+    
+    This endpoint:
+    1. Receives a new frame from the mobile client (no bounding boxes needed!)
+    2. Uses SAM2's internal memory to track the objects defined during /initialize
+    3. Returns updated bounding boxes and object IDs for the tracked objects
+    
+    The predictor maintains temporal memory across frames, so it can track objects
+    even if they move, change appearance, or are temporarily occluded.
     
     Request body:
     {
         "session_id": "unique_session_id",
-        "image": "base64_encoded_image_or_data_url"
+        "image": "base64_encoded_image_or_data_url"  # No bounding boxes needed!
     }
     
     Response:
     {
         "success": true,
         "session_id": "unique_session_id",
-        "object_ids": [1, 2, ...],
-        "bounding_boxes": [[x0, y0, x1, y1], ...],
-        "frame_index": 1
+        "object_ids": [1, 2, ...],  # Same object IDs from initialization
+        "bounding_boxes": [[x0, y0, x1, y1], ...],  # Updated bounding boxes from segmentation
+        "frame_index": 1  # Increments with each tracked frame
     }
     """
     global predictor, session_states
@@ -497,6 +530,8 @@ def track_frame():
         
         with predictor_lock:
             # Track objects in the new frame
+            # The predictor maintains internal state (memory) from previous frames
+            # and uses it to track the objects defined during initialization
             obj_ids, mask_logits = predictor.track(frame)
             
             # Update session state

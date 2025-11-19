@@ -216,6 +216,72 @@ def format_masks(mask_logits: torch.Tensor) -> torch.Tensor:
     return mask_probs
 
 
+def mask_logits_to_binary_masks(
+    mask_logits: torch.Tensor,
+    threshold: float = 0.5,
+    frame_shape: Optional[Tuple[int, int]] = None,
+) -> List[Optional[np.ndarray]]:
+    """Convert mask logits to binary masks (0/1 numpy arrays).
+    
+    Args:
+        mask_logits: Tensor of shape (num_obj, H, W) or similar
+        threshold: Threshold for binarization
+        frame_shape: Optional (height, width) to resize masks to match frame dimensions
+    
+    Returns:
+        List of binary masks (numpy arrays of 0s and 1s), one per object
+    """
+    if mask_logits is None:
+        return []
+    
+    try:
+        mask_probs = format_masks(mask_logits).detach().cpu().numpy()
+        binary_masks = []
+        
+        for i in range(mask_probs.shape[0]):
+            mask = mask_probs[i] > threshold
+            
+            # Resize to frame shape if needed
+            if frame_shape is not None:
+                h, w = frame_shape
+                if mask.shape[0] != h or mask.shape[1] != w:
+                    mask = cv2.resize(
+                        mask.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST
+                    ).astype(bool)
+            
+            binary_masks.append(mask.astype(np.uint8))  # Convert to uint8 (0 or 1)
+        
+        return binary_masks
+    except Exception as e:
+        logger.error(f"Error converting mask logits to binary masks: {e}", exc_info=True)
+        return []
+
+
+def encode_binary_mask(mask: Optional[np.ndarray]) -> Optional[str]:
+    """Encode binary mask to base64 string for JSON transmission.
+    
+    Args:
+        mask: Binary mask as numpy array (0s and 1s) or None
+    
+    Returns:
+        Base64-encoded string of the mask data, or None if mask is None/empty
+    """
+    if mask is None:
+        return None
+    
+    try:
+        # Flatten the mask and encode as base64
+        # The mask is already uint8 (0 or 1), so we can directly encode it
+        mask_bytes = mask.tobytes()
+        mask_encoded = base64.b64encode(mask_bytes).decode('utf-8')
+        return mask_encoded
+    except Exception as e:
+        logger.error(f"Error encoding binary mask: {e}", exc_info=True)
+        return None
+
+
 def overlay_masks_and_bboxes(
     frame: np.ndarray,
     obj_ids: List[int],
@@ -355,7 +421,8 @@ def initialize_session():
         "session_id": "unique_session_id",
         "image": "base64_encoded_image_or_data_url",
         "bounding_boxes": [[x0, y0, x1, y1], ...],  # List of bounding boxes (ONLY in first request)
-        "object_ids": [1, 2, ...]  # Optional: custom object IDs
+        "object_ids": [1, 2, ...],  # Optional: custom object IDs
+        "include_masks": true  # Optional: if true, returns binary masks in response
     }
     
     Response:
@@ -364,8 +431,14 @@ def initialize_session():
         "session_id": "unique_session_id",
         "object_ids": [1, 2, ...],
         "bounding_boxes": [[x0, y0, x1, y1], ...],  # Bounding boxes extracted from segmentation masks
-        "frame_shape": [height, width]
+        "frame_shape": [height, width],
+        "masks": ["base64_encoded_mask", ...]  # Optional: binary masks (base64 encoded) if include_masks=true
     }
+    
+    Note: Masks are base64-encoded binary arrays (0s and 1s). To decode:
+    1. Decode base64 string to bytes
+    2. Convert bytes to numpy array: np.frombuffer(mask_bytes, dtype=np.uint8)
+    3. Reshape to (height, width) using frame_shape
     
     Note: Currently only one active session is supported at a time.
     Initializing a new session will reset the tracking state.
@@ -384,6 +457,7 @@ def initialize_session():
         image_data = data.get("image")
         bounding_boxes = data.get("bounding_boxes", [])
         object_ids = data.get("object_ids", None)
+        include_masks = data.get("include_masks", False)
         
         if not image_data:
             return jsonify({"error": "No image data provided"}), 400
@@ -441,6 +515,7 @@ def initialize_session():
                 "frame_count": 0,
                 "initial_frame_shape": [height, width],
                 "original_object_ids": initialized_obj_ids.copy(),  # Store original IDs for consistent mapping
+                "frame_shape": (height, width),  # Store frame shape for mask encoding
             }
         
         # Extract bounding boxes from masks for response
@@ -484,13 +559,33 @@ def initialize_session():
                 is_interactive=is_interactive,
             )
         
-        return jsonify({
+        # Prepare response
+        response_data = {
             "success": True,
             "session_id": session_id,
             "object_ids": initialized_obj_ids,
             "bounding_boxes": result_bboxes,
             "frame_shape": [height, width]
-        })
+        }
+        
+        # Include masks if requested
+        if include_masks and combined_mask_logits is not None:
+            binary_masks = mask_logits_to_binary_masks(
+                combined_mask_logits,
+                threshold=args.mask_threshold,
+                frame_shape=(height, width)
+            )
+            # Encode masks to base64
+            encoded_masks = []
+            for idx, obj_id in enumerate(initialized_obj_ids):
+                if idx < len(binary_masks):
+                    encoded_mask = encode_binary_mask(binary_masks[idx])
+                    encoded_masks.append(encoded_mask)
+                else:
+                    encoded_masks.append(None)
+            response_data["masks"] = encoded_masks
+        
+        return jsonify(response_data)
     
     except Exception as e:
         logger.error(f"Error initializing session: {e}", exc_info=True)
@@ -514,7 +609,8 @@ def track_frame():
     Request body:
     {
         "session_id": "unique_session_id",
-        "image": "base64_encoded_image_or_data_url"  # No bounding boxes needed!
+        "image": "base64_encoded_image_or_data_url",  # No bounding boxes needed!
+        "include_masks": true  # Optional: if true, returns binary masks in response
     }
     
     Response:
@@ -522,9 +618,16 @@ def track_frame():
         "success": true,
         "session_id": "unique_session_id",
         "object_ids": [1, 2, ...],  # Same object IDs from initialization
-        "bounding_boxes": [[x0, y0, x1, y1], ...],  # Updated bounding boxes from segmentation
-        "frame_index": 1  # Increments with each tracked frame
+        "bounding_boxes": [[x0, y0, x1, y1], ...],  # Updated bounding boxes from segmentation (null for lost objects)
+        "frame_index": 1,  # Increments with each tracked frame
+        "frame_shape": [height, width],  # Frame dimensions (needed to decode masks)
+        "masks": ["base64_encoded_mask", ...]  # Optional: binary masks (base64 encoded) if include_masks=true (null for lost objects)
     }
+    
+    Note: Masks are base64-encoded binary arrays (0s and 1s). To decode:
+    1. Decode base64 string to bytes
+    2. Convert bytes to numpy array: np.frombuffer(mask_bytes, dtype=np.uint8)
+    3. Reshape to (height, width) using frame_shape
     """
     global predictor, session_states
     
@@ -538,6 +641,7 @@ def track_frame():
         
         session_id = data.get("session_id")
         image_data = data.get("image")
+        include_masks = data.get("include_masks", False)
         
         if not session_id:
             return jsonify({"error": "No session_id provided"}), 400
@@ -551,10 +655,12 @@ def track_frame():
         
         # Decode image
         frame = decode_image(image_data)
+        height, width = frame.shape[:2]
         
-        # Get original object IDs from session state
+        # Get original object IDs and frame shape from session state
         session_state = session_states[session_id]
         original_object_ids = session_state.get("original_object_ids", [])
+        frame_shape = session_state.get("frame_shape", (height, width))
         
         with predictor_lock:
             # Track objects in the new frame
@@ -582,6 +688,16 @@ def track_frame():
         # For each original object ID, find its bounding box if it's still tracked
         result_bboxes = []
         result_object_ids = []
+        result_masks = []  # For masks if requested
+        
+        # Convert masks to binary if requested
+        binary_masks_list = []
+        if include_masks and mask_logits is not None:
+            binary_masks_list = mask_logits_to_binary_masks(
+                mask_logits,
+                threshold=args.mask_threshold,
+                frame_shape=frame_shape
+            )
         
         for original_obj_id in original_object_ids:
             if original_obj_id in tracked_id_to_index:
@@ -590,14 +706,24 @@ def track_frame():
                 if idx < len(extracted_bboxes) and extracted_bboxes[idx] is not None:
                     result_bboxes.append(extracted_bboxes[idx])
                     result_object_ids.append(original_obj_id)
+                    # Include mask if requested
+                    if include_masks and idx < len(binary_masks_list):
+                        encoded_mask = encode_binary_mask(binary_masks_list[idx])
+                        result_masks.append(encoded_mask)
+                    elif include_masks:
+                        result_masks.append(None)
                 else:
                     # Object tracked but no valid bounding box - return None
                     result_bboxes.append(None)
                     result_object_ids.append(original_obj_id)
+                    if include_masks:
+                        result_masks.append(None)
             else:
                 # Object is lost - return None for bounding box but keep the ID
                 result_bboxes.append(None)
                 result_object_ids.append(original_obj_id)
+                if include_masks:
+                    result_masks.append(None)
         
         # For visualization, we need to create a mask_logits tensor that matches original IDs
         # This is tricky because mask_logits only has masks for tracked objects
@@ -633,13 +759,21 @@ def track_frame():
         # Filter out None values or keep them as null - we'll keep them as null to maintain ID consistency
         response_bboxes = [bbox if bbox is not None else None for bbox in result_bboxes]
         
-        return jsonify({
+        # Prepare response
+        response_data = {
             "success": True,
             "session_id": session_id,
             "object_ids": result_object_ids,  # Always return original IDs in order
             "bounding_boxes": response_bboxes,  # null for lost objects, bbox for tracked objects
-            "frame_index": frame_index
-        })
+            "frame_index": frame_index,
+            "frame_shape": [height, width]  # Frame dimensions (needed to decode masks)
+        }
+        
+        # Include masks if requested
+        if include_masks:
+            response_data["masks"] = result_masks  # null for lost objects, base64 string for tracked objects
+        
+        return jsonify(response_data)
     
     except Exception as e:
         logger.error(f"Error tracking frame: {e}", exc_info=True)

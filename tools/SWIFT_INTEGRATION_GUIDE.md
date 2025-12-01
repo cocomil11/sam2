@@ -54,7 +54,8 @@ The SAM2 Mobile Server provides REST API endpoints for:
   "session_id": "unique_session_id",
   "image": "base64_encoded_image",
   "bounding_boxes": [[x0, y0, x1, y1], ...],
-  "object_ids": [1, 2, ...]  // Optional
+  "object_ids": [1, 2, ...],  // Optional
+  "include_masks": true       // Optional: request binary masks
 }
 ```
 
@@ -65,9 +66,12 @@ The SAM2 Mobile Server provides REST API endpoints for:
   "session_id": "unique_session_id",
   "object_ids": [1, 2, ...],
   "bounding_boxes": [[x0, y0, x1, y1], ...],
-  "frame_shape": [height, width]
+  "frame_shape": [height, width],
+  "masks": ["base64_mask_1", "base64_mask_2", ...]  // Present only if include_masks=true
 }
 ```
+
+**Mask Format:** Masks are base64-encoded binary arrays (0 = background, 1 = object) laid out in row-major order. See [Mask Handling](#mask-handling) for decoding instructions.
 
 ### 3. Track Frame
 **POST** `/track`
@@ -76,7 +80,8 @@ The SAM2 Mobile Server provides REST API endpoints for:
 ```json
 {
   "session_id": "unique_session_id",
-  "image": "base64_encoded_image"
+  "image": "base64_encoded_image",
+  "include_masks": true  // Optional: request binary masks for tracked objects
 }
 ```
 
@@ -86,8 +91,10 @@ The SAM2 Mobile Server provides REST API endpoints for:
   "success": true,
   "session_id": "unique_session_id",
   "object_ids": [1, 2, ...],
-  "bounding_boxes": [[x0, y0, x1, y1], null, ...],
-  "frame_index": 1
+  "bounding_boxes": [[x0, y0, x1, y1], null, ...],  // null for lost objects
+  "frame_index": 1,
+  "frame_shape": [height, width],
+  "masks": ["base64_mask_1", null, ...]  // Same ordering as object_ids (null for lost objects)
 }
 ```
 
@@ -110,22 +117,26 @@ struct InitializeRequest: Codable {
     let image: String  // Base64 encoded
     let boundingBoxes: [[Double]]
     let objectIds: [Int]?
+    let includeMasks: Bool?
     
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case image
         case boundingBoxes = "bounding_boxes"
         case objectIds = "object_ids"
+        case includeMasks = "include_masks"
     }
 }
 
 struct TrackRequest: Codable {
     let sessionId: String
     let image: String  // Base64 encoded
+    let includeMasks: Bool?
     
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
         case image
+        case includeMasks = "include_masks"
     }
 }
 
@@ -146,6 +157,7 @@ struct InitializeResponse: Codable {
     let objectIds: [Int]
     let boundingBoxes: [[Double]]
     let frameShape: [Int]
+    let masks: [String?]?
     
     enum CodingKeys: String, CodingKey {
         case success
@@ -153,6 +165,7 @@ struct InitializeResponse: Codable {
         case objectIds = "object_ids"
         case boundingBoxes = "bounding_boxes"
         case frameShape = "frame_shape"
+        case masks
     }
 }
 
@@ -162,6 +175,8 @@ struct TrackResponse: Codable {
     let objectIds: [Int]
     let boundingBoxes: [BoundingBox?]  // Optional - null for lost objects
     let frameIndex: Int
+    let frameShape: [Int]
+    let masks: [String?]?
     
     enum CodingKeys: String, CodingKey {
         case success
@@ -169,6 +184,8 @@ struct TrackResponse: Codable {
         case objectIds = "object_ids"
         case boundingBoxes = "bounding_boxes"
         case frameIndex = "frame_index"
+        case frameShape = "frame_shape"
+        case masks
     }
     
     init(from decoder: Decoder) throws {
@@ -177,6 +194,8 @@ struct TrackResponse: Codable {
         sessionId = try container.decode(String.self, forKey: .sessionId)
         objectIds = try container.decode([Int].self, forKey: .objectIds)
         frameIndex = try container.decode(Int.self, forKey: .frameIndex)
+        frameShape = try container.decode([Int].self, forKey: .frameShape)
+        masks = try container.decodeIfPresent([String?].self, forKey: .masks)
         
         // Handle optional bounding boxes (null values)
         if let bboxArray = try? container.decode([OptionalBoundingBox].self, forKey: .boundingBoxes) {
@@ -229,6 +248,86 @@ struct BoundingBox {
         self.x1 = array[2]
         self.y1 = array[3]
     }
+}
+```
+
+### Mask Handling Utilities
+
+Masks (if requested) are base64-encoded binary arrays that match `frame_shape` and align with `objectIds`. Use the helpers below to decode masks and convert them into overlays for annotation.
+
+```swift
+import Foundation
+import UIKit
+
+typealias BinaryMask = [[UInt8]]
+
+/// Decode a base64 mask string into a 2D UInt8 array using frame dimensions
+func decodeMask(_ encodedMask: String?, frameShape: [Int]) -> BinaryMask? {
+    guard let encodedMask = encodedMask,
+          frameShape.count == 2,
+          let data = Data(base64Encoded: encodedMask) else {
+        return nil
+    }
+    
+    let height = frameShape[0]
+    let width = frameShape[1]
+    let bytes = [UInt8](data)
+    guard bytes.count == height * width else {
+        return nil
+    }
+    
+    var mask: BinaryMask = []
+    mask.reserveCapacity(height)
+    for row in 0..<height {
+        let start = row * width
+        let end = start + width
+        mask.append(Array(bytes[start..<end]))
+    }
+    return mask
+}
+
+/// Create a semi-transparent overlay from a binary mask
+func createMaskOverlay(mask: BinaryMask, color: UIColor, alpha: CGFloat = 0.4) -> UIImage? {
+    guard let firstRow = mask.first else { return nil }
+    let height = mask.count
+    let width = firstRow.count
+    
+    let bytesPerPixel = 4
+    let bytesPerRow = bytesPerPixel * width
+    var pixelBytes = [UInt8](repeating: 0, count: height * bytesPerRow)
+    
+    var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+    color.getRed(&r, green: &g, blue: &b, alpha: &a)
+    
+    for row in 0..<height {
+        for col in 0..<width {
+            guard mask[row][col] == 1 else { continue }
+            let offset = row * bytesPerRow + col * bytesPerPixel
+            pixelBytes[offset] = UInt8(r * 255)
+            pixelBytes[offset + 1] = UInt8(g * 255)
+            pixelBytes[offset + 2] = UInt8(b * 255)
+            pixelBytes[offset + 3] = UInt8(alpha * 255)
+        }
+    }
+    
+    guard let provider = CGDataProvider(data: Data(pixelBytes) as CFData),
+          let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: bytesPerPixel * 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+          ) else {
+        return nil
+    }
+    
+    return UIImage(cgImage: cgImage)
 }
 ```
 
@@ -312,7 +411,8 @@ class SAM2Client {
         sessionId: String,
         image: UIImage,
         boundingBoxes: [BoundingBox],
-        objectIds: [Int]? = nil
+        objectIds: [Int]? = nil,
+        requestMasks: Bool = false
     ) async throws -> InitializeResponse {
         guard let imageBase64 = image.toBase64() else {
             throw SAM2Error.invalidImage
@@ -325,7 +425,8 @@ class SAM2Client {
             sessionId: sessionId,
             image: imageBase64,
             boundingBoxes: boundingBoxes.map { $0.asArray },
-            objectIds: finalObjectIds
+            objectIds: finalObjectIds,
+            includeMasks: requestMasks ? true : nil
         )
         
         guard let url = URL(string: "\(baseURL)/initialize") else {
@@ -362,12 +463,12 @@ class SAM2Client {
     }
     
     // MARK: - Track Frame
-    func trackFrame(sessionId: String, image: UIImage) async throws -> TrackResponse {
+    func trackFrame(sessionId: String, image: UIImage, requestMasks: Bool = false) async throws -> TrackResponse {
         guard let imageBase64 = image.toBase64() else {
             throw SAM2Error.invalidImage
         }
         
-        let request = TrackRequest(sessionId: sessionId, image: imageBase64)
+        let request = TrackRequest(sessionId: sessionId, image: imageBase64, includeMasks: requestMasks ? true : nil)
         
         guard let url = URL(string: "\(baseURL)/track") else {
             throw SAM2Error.invalidURL
@@ -448,19 +549,24 @@ class TrackingViewController: UIViewController {
     }
     
     // MARK: - Initialize Tracking
-    func initializeTracking(image: UIImage, boundingBoxes: [BoundingBox]) {
+    func initializeTracking(image: UIImage, boundingBoxes: [BoundingBox], requestMasks: Bool = false) {
         Task {
             do {
                 let response = try await client.initializeSession(
                     sessionId: sessionId,
                     image: image,
-                    boundingBoxes: boundingBoxes
+                    boundingBoxes: boundingBoxes,
+                    requestMasks: requestMasks
                 )
                 
                 DispatchQueue.main.async {
                     self.isInitialized = true
                     print("Initialized with \(response.objectIds.count) objects")
                     print("Bounding boxes: \(response.boundingBoxes)")
+                    
+                    if requestMasks {
+                        self.logMasks(response.masks, frameShape: response.frameShape)
+                    }
                 }
             } catch {
                 print("Initialization failed: \(error)")
@@ -472,7 +578,7 @@ class TrackingViewController: UIViewController {
     }
     
     // MARK: - Track Frame
-    func trackFrame(image: UIImage) {
+    func trackFrame(image: UIImage, requestMasks: Bool = false) {
         guard isInitialized else {
             print("Session not initialized. Call initializeTracking first.")
             return
@@ -482,7 +588,8 @@ class TrackingViewController: UIViewController {
             do {
                 let response = try await client.trackFrame(
                     sessionId: sessionId,
-                    image: image
+                    image: image,
+                    requestMasks: requestMasks
                 )
                 
                 DispatchQueue.main.async {
@@ -504,11 +611,9 @@ class TrackingViewController: UIViewController {
     
     // MARK: - Helper Methods
     private func updateTrackingResults(_ response: TrackResponse) {
-        // Handle tracking results with consistent object IDs
-        // Note: boundingBoxes array may contain nil for lost objects
-        
         for (index, objectId) in response.objectIds.enumerated() {
-            if let bbox = response.boundingBoxes[index] {
+            let bbox = index < response.boundingBoxes.count ? response.boundingBoxes[index] : nil
+            if let bbox = bbox {
                 // Object is tracked - update UI with bounding box
                 print("Object \(objectId) is at: \(bbox.asArray)")
                 // Draw bounding box on UI
@@ -516,6 +621,28 @@ class TrackingViewController: UIViewController {
                 // Object is lost - hide or mark as lost
                 print("Object \(objectId) is lost (not tracked in this frame)")
                 // Hide bounding box or show "lost" indicator
+            }
+            
+            let maskString: String?
+            if let masks = response.masks, index < masks.count {
+                maskString = masks[index]
+            } else {
+                maskString = nil
+            }
+            
+            if let mask = decodeMask(maskString, frameShape: response.frameShape) {
+                print("Mask for object \(objectId) decoded (\(mask.count) x \(mask.first?.count ?? 0))")
+                // Convert to overlay: let overlay = createMaskOverlay(mask: mask, color: .systemBlue)
+                // Display overlay on top of your frame/image view
+            }
+        }
+    }
+    
+    private func logMasks(_ masks: [String?]?, frameShape: [Int]) {
+        guard let masks = masks else { return }
+        for (index, maskString) in masks.enumerated() {
+            if let mask = decodeMask(maskString, frameShape: frameShape) {
+                print("Decoded mask for init object \(index + 1) (\(mask.count) x \(mask.first?.count ?? 0))")
             }
         }
     }
@@ -581,18 +708,22 @@ class CameraTrackingViewController: UIViewController {
     }
     
     // MARK: - Initialize with First Frame
-    func initializeWithFirstFrame(_ image: UIImage, boundingBoxes: [BoundingBox]) {
+    func initializeWithFirstFrame(_ image: UIImage, boundingBoxes: [BoundingBox], requestMasks: Bool = true) {
         Task {
             do {
                 let response = try await client.initializeSession(
                     sessionId: sessionId,
                     image: image,
-                    boundingBoxes: boundingBoxes
+                    boundingBoxes: boundingBoxes,
+                    requestMasks: requestMasks
                 )
                 
                 DispatchQueue.main.async {
                     self.isInitialized = true
                     print("Initialized successfully")
+                    if requestMasks {
+                        self.logMasks(response.masks, frameShape: response.frameShape)
+                    }
                 }
             } catch {
                 print("Initialization error: \(error)")
@@ -614,20 +745,20 @@ extension CameraTrackingViewController: AVCaptureVideoDataOutputSampleBufferDele
         let uiImage = UIImage(cgImage: cgImage)
         
         // Track frame (throttle to 2 FPS)
-        trackFrame(image: uiImage)
+        trackFrame(image: uiImage, requestMasks: true)
     }
     
     private var lastTrackTime: Date = Date()
     private let trackInterval: TimeInterval = 0.5 // 2 FPS
     
-    private func trackFrame(image: UIImage) {
+    private func trackFrame(image: UIImage, requestMasks: Bool) {
         let now = Date()
         guard now.timeIntervalSince(lastTrackTime) >= trackInterval else { return }
         lastTrackTime = now
         
         Task {
             do {
-                let response = try await client.trackFrame(sessionId: sessionId, image: image)
+                let response = try await client.trackFrame(sessionId: sessionId, image: image, requestMasks: requestMasks)
                 DispatchQueue.main.async {
                     // Update UI with tracking results
                     self.updateTrackingResults(response)
@@ -639,7 +770,36 @@ extension CameraTrackingViewController: AVCaptureVideoDataOutputSampleBufferDele
     }
     
     private func updateTrackingResults(_ response: TrackResponse) {
-        // Update your UI here
+        for (index, objectId) in response.objectIds.enumerated() {
+            let bbox = index < response.boundingBoxes.count ? response.boundingBoxes[index] : nil
+            if let bbox = bbox {
+                print("Camera object \(objectId) bbox: \(bbox.asArray)")
+            } else {
+                print("Camera object \(objectId) lost")
+            }
+            
+            let maskString: String?
+            if let masks = response.masks, index < masks.count {
+                maskString = masks[index]
+            } else {
+                maskString = nil
+            }
+            
+            if let mask = decodeMask(maskString, frameShape: response.frameShape),
+               let overlay = createMaskOverlay(mask: mask, color: .systemGreen, alpha: 0.3) {
+                // Display overlay on your preview layer / UIImageView
+                print("Overlay ready for object \(objectId) (\(overlay.size))")
+            }
+        }
+    }
+    
+    private func logMasks(_ masks: [String?]?, frameShape: [Int]) {
+        guard let masks = masks else { return }
+        for (index, maskString) in masks.enumerated() {
+            if let mask = decodeMask(maskString, frameShape: frameShape) {
+                print("Camera init mask \(index + 1) decoded (\(mask.count)x\(mask.first?.count ?? 0))")
+            }
+        }
     }
 }
 ```

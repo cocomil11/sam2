@@ -324,11 +324,224 @@ netsh interface portproxy delete v4tov4 listenport=8080 listenaddress=0.0.0.0
 netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=%WSL_IP%
 ```
 
+## Making Server Accessible from Internet
+
+**⚠️ SECURITY WARNING:** Exposing your server to the internet makes it accessible to anyone. The current server has **NO authentication**. Only do this if:
+- You understand the security risks
+- You plan to add authentication/authorization
+- You're using this for testing/development only
+- You have proper network security measures in place
+
+### Prerequisites
+
+1. **Public IP Address**: Your router must have a public IP (most home internet connections do)
+2. **Router Access**: You need admin access to your router
+3. **Static IP (Optional)**: If your ISP provides a dynamic IP, consider using Dynamic DNS
+
+### Step 1: Find Your Public IP
+
+**From Windows:**
+```powershell
+# Check your current public IP
+curl https://api.ipify.org
+# Or visit: https://whatismyipaddress.com/
+```
+
+This is the IP address that external devices will use to connect.
+
+### Step 2: Configure Router Port Forwarding
+
+**Important:** Router interfaces vary, but the general steps are:
+
+1. **Access Router Admin Panel**
+   - Usually: `http://192.168.1.1` or `http://192.168.0.1`
+   - Check router manual for default IP and credentials
+
+2. **Find Port Forwarding/Virtual Server Settings**
+   - Look for: "Port Forwarding", "Virtual Server", "NAT", or "Firewall Rules"
+   - Common locations: Advanced → NAT, Firewall → Port Forwarding
+
+3. **Add Port Forwarding Rule**
+   - **Service Name**: SAM2 Server (or any name)
+   - **External Port**: 8080 (or your chosen port)
+   - **Internal IP**: Your Windows network IP (e.g., `10.89.232.20`)
+   - **Internal Port**: 8080
+   - **Protocol**: TCP
+   - **Enable**: Yes
+
+4. **Save and Apply**
+
+**Example Router Configuration:**
+```
+External Port: 8080
+Internal IP: 10.89.232.20
+Internal Port: 8080
+Protocol: TCP
+```
+
+### Step 3: Configure Windows Firewall (Already Done)
+
+If you followed the local network setup, Windows Firewall should already allow port 8080. Verify:
+
+```powershell
+Get-NetFirewallRule -DisplayName "SAM2*" | Format-Table DisplayName, Enabled, Direction, Action
+```
+
+### Step 4: Handle Dynamic IP (If Needed)
+
+If your ISP assigns a dynamic IP that changes, use Dynamic DNS:
+
+**Option A: Use a Dynamic DNS Service**
+1. Sign up for a free service: No-IP, DuckDNS, or Dynu
+2. Install their client on Windows
+3. Get a domain like: `yourname.ddns.net`
+4. Use this domain instead of IP address
+
+**Option B: Use ngrok (Easier for Testing)**
+```bash
+# Install ngrok from https://ngrok.com/
+# In WSL or Windows:
+ngrok http 8080
+# This gives you a public URL like: https://abc123.ngrok.io
+```
+
+### Step 5: Test Internet Access
+
+**From Another Network (or use mobile data):**
+```bash
+# Replace with your public IP or domain
+curl http://<YOUR_PUBLIC_IP>:8080/health
+
+# Or if using ngrok:
+curl https://abc123.ngrok.io/health
+```
+
+**From Mobile Device (on different network):**
+```swift
+// Use public IP or domain
+let client = SAM2Client(baseURL: "http://<YOUR_PUBLIC_IP>:8080")
+// Or with ngrok:
+let client = SAM2Client(baseURL: "https://abc123.ngrok.io")
+```
+
+### Security Recommendations
+
+**⚠️ CRITICAL: The current server has NO authentication!**
+
+Before exposing to internet, consider:
+
+1. **Add Authentication**
+   - API keys or tokens
+   - Basic HTTP authentication
+   - OAuth/JWT tokens
+
+2. **Use HTTPS**
+   - Set up SSL/TLS certificate
+   - Use reverse proxy (nginx, Caddy) with Let's Encrypt
+
+3. **Rate Limiting**
+   - Limit requests per IP
+   - Prevent abuse
+
+4. **Firewall Rules**
+   - Only allow specific IPs if possible
+   - Use fail2ban or similar
+
+5. **Monitor Access**
+   - Log all requests
+   - Set up alerts for suspicious activity
+
+### Quick Setup with ngrok (Easiest for Testing)
+
+**For quick testing without router configuration:**
+
+```bash
+# 1. Download ngrok from https://ngrok.com/
+# 2. Extract and add to PATH
+
+# 3. Start your SAM2 server (in WSL)
+python tools/sam_mobile_server.py --port 8080 ...
+
+# 4. In another terminal, start ngrok (in WSL or Windows)
+ngrok http 8080
+
+# 5. You'll get output like:
+# Forwarding  https://abc123.ngrok.io -> http://localhost:8080
+# Use this URL in your mobile app
+```
+
+**Pros:**
+- No router configuration needed
+- Works behind NAT/firewall
+- HTTPS included
+- Quick setup
+
+**Cons:**
+- Free tier has limitations (connection limits, random URLs)
+- URLs change on restart (unless paid plan)
+- Not suitable for production
+
+### Troubleshooting Internet Access
+
+**Issue: Can't connect from internet**
+
+1. **Check Router Port Forwarding**
+   - Verify rule is enabled
+   - Check internal IP is correct
+   - Try different external port (some ISPs block common ports)
+
+2. **Check ISP Restrictions**
+   - Some ISPs block incoming connections
+   - Some block port 8080
+   - Try different port (e.g., 8443, 9000)
+
+3. **Check Windows Firewall**
+   ```powershell
+   Get-NetFirewallRule -DisplayName "SAM2*"
+   ```
+
+4. **Test Locally First**
+   ```powershell
+   # Should work from Windows
+   curl http://localhost:8080/health
+   ```
+
+5. **Use Port Checker**
+   - Visit: https://www.yougetsignal.com/tools/open-ports/
+   - Enter your public IP and port 8080
+   - Should show "Open" if forwarding works
+
+6. **Check Router Firewall**
+   - Some routers have additional firewall rules
+   - May need to allow WAN access
+
+### Alternative: Cloud Deployment
+
+For production use, consider deploying to:
+- **AWS EC2 / Lightsail**
+- **Google Cloud Platform**
+- **Azure**
+- **DigitalOcean**
+- **Heroku** (with modifications)
+
+These provide:
+- Static IP addresses
+- Better security
+- Scalability
+- Managed services
+
 ## Summary
 
+### Local Network Access (Current Setup)
 1. **WSL IP** (172.21.129.92) - Only accessible from Windows host
 2. **Windows Network IP** (192.168.x.x) - Accessible from other devices on same network
 3. **Port Forwarding** - Maps Windows IP:8080 → WSL IP:8080
 4. **Firewall** - Must allow incoming connections on port 8080
 5. **Mobile App** - Use Windows network IP, not WSL IP
+
+### Internet Access (Additional Steps)
+1. **Router Port Forwarding** - External Port 8080 → Windows IP:8080
+2. **Public IP or Domain** - Use public IP or Dynamic DNS
+3. **Security** - Add authentication and HTTPS (recommended)
+4. **Mobile App** - Use public IP/domain instead of local IP
 

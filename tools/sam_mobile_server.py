@@ -495,7 +495,7 @@ def initialize_session():
                 # This tells SAM2 what objects to track in subsequent frames
                 # Each object has a unique obj_id, so clear_old_points=True is safe for all objects
                 # (it only clears points for that specific object, not all objects)
-                _, obj_ids, mask_logits = predictor.add_new_prompt(
+                _, returned_obj_ids, mask_logits = predictor.add_new_prompt(
                     frame_idx=0,
                     obj_id=obj_id,
                     bbox=bbox,
@@ -503,7 +503,10 @@ def initialize_session():
                     normalize_coords=True,
                 )
                 
-                initialized_obj_ids.extend(list(obj_ids))
+                # Use the explicitly assigned obj_id, not what's returned from predictor
+                # This ensures 1:1 mapping between bounding boxes and object IDs
+                initialized_obj_ids.append(obj_id)
+                
                 if mask_logits is not None:
                     if mask_logits.dim() == 2:
                         mask_logits = mask_logits.unsqueeze(0)

@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import shutil
+import socket
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -545,22 +547,22 @@ def initialize_session():
                     if idx < len(bounding_boxes):
                         result_bboxes.append(bounding_boxes[idx])
         
-        # Save analyzed image if enabled
-        if args.save_images:
-            # Check if this is an interactive session (session_id contains "interactive")
-            is_interactive = "interactive" in session_id.lower()
-            save_analyzed_image(
-                frame=frame,
-                session_id=session_id,
-                frame_index=0,
-                obj_ids=initialized_obj_ids,
-                mask_logits=combined_mask_logits,
-                bboxes=result_bboxes if result_bboxes else bounding_boxes,
-                output_dir=args.output_dir,
-                threshold=args.mask_threshold,
-                alpha=args.alpha,
-                is_interactive=is_interactive,
-            )
+        # Image saving disabled - uncomment below to re-enable
+        # if args.save_images:
+        #     # Check if this is an interactive session (session_id contains "interactive")
+        #     is_interactive = "interactive" in session_id.lower()
+        #     save_analyzed_image(
+        #         frame=frame,
+        #         session_id=session_id,
+        #         frame_index=0,
+        #         obj_ids=initialized_obj_ids,
+        #         mask_logits=combined_mask_logits,
+        #         bboxes=result_bboxes if result_bboxes else bounding_boxes,
+        #         output_dir=args.output_dir,
+        #         threshold=args.mask_threshold,
+        #         alpha=args.alpha,
+        #         is_interactive=is_interactive,
+        #     )
         
         # Prepare response
         response_data = {
@@ -741,22 +743,22 @@ def track_frame():
             visualization_obj_ids = []
             visualization_mask_logits = None
         
-        # Save analyzed image if enabled
-        if args.save_images:
-            # Check if this is an interactive session (session_id contains "interactive")
-            is_interactive = "interactive" in session_id.lower()
-            save_analyzed_image(
-                frame=frame,
-                session_id=session_id,
-                frame_index=frame_index,
-                obj_ids=visualization_obj_ids,  # Use tracked IDs for visualization
-                mask_logits=visualization_mask_logits,
-                bboxes=[bbox for bbox in result_bboxes if bbox is not None],  # Only non-None bboxes for visualization
-                output_dir=args.output_dir,
-                threshold=args.mask_threshold,
-                alpha=args.alpha,
-                is_interactive=is_interactive,
-            )
+        # Image saving disabled - uncomment below to re-enable
+        # if args.save_images:
+        #     # Check if this is an interactive session (session_id contains "interactive")
+        #     is_interactive = "interactive" in session_id.lower()
+        #     save_analyzed_image(
+        #         frame=frame,
+        #         session_id=session_id,
+        #         frame_index=frame_index,
+        #         obj_ids=visualization_obj_ids,  # Use tracked IDs for visualization
+        #         mask_logits=visualization_mask_logits,
+        #         bboxes=[bbox for bbox in result_bboxes if bbox is not None],  # Only non-None bboxes for visualization
+        #         output_dir=args.output_dir,
+        #         threshold=args.mask_threshold,
+        #         alpha=args.alpha,
+        #         is_interactive=is_interactive,
+        #     )
         
         # Convert None to null for JSON (Flask handles this automatically, but be explicit)
         # Filter out None values or keep them as null - we'll keep them as null to maintain ID consistency
@@ -865,6 +867,124 @@ def cleanup_output_directory(output_dir: str):
         logger.warning(f"Failed to clean up output directory {output_dir}: {e}")
 
 
+def get_network_ips(port: int) -> List[str]:
+    """Get network IP addresses that other devices can use to connect.
+    
+    Returns a list of IP addresses (excluding localhost and WSL bridge IPs).
+    """
+    network_ips = []
+    
+    try:
+        # Get Windows host IP from WSL (if running in WSL)
+        try:
+            with open('/etc/resolv.conf', 'r') as f:
+                for line in f:
+                    if line.startswith('nameserver'):
+                        windows_host_ip = line.split()[1]
+                        # Filter out WSL bridge IPs (172.x.x.x range)
+                        if not windows_host_ip.startswith('172.'):
+                            network_ips.append(windows_host_ip)
+                        break
+        except (FileNotFoundError, IndexError):
+            pass
+        
+        # Get all network interfaces using socket
+        hostname = socket.gethostname()
+        try:
+            # Get IP by hostname
+            ip = socket.gethostbyname(hostname)
+            if ip not in ['127.0.0.1', 'localhost'] and not ip.startswith('172.21.'):
+                if ip not in network_ips:
+                    network_ips.append(ip)
+        except socket.gaierror:
+            pass
+        
+        # Get IPs from all network interfaces
+        try:
+            import netifaces
+            for interface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(interface)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        ip = addr_info.get('addr')
+                        if ip and ip != '127.0.0.1' and not ip.startswith('172.21.'):
+                            if ip not in network_ips:
+                                network_ips.append(ip)
+        except (ImportError, AttributeError):
+            # netifaces not available, try alternative method
+            try:
+                # Try to get IP from socket connection
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    # Connect to a remote address (doesn't actually send data)
+                    s.connect(('8.8.8.8', 80))
+                    ip = s.getsockname()[0]
+                    if ip and ip != '127.0.0.1' and not ip.startswith('172.21.'):
+                        if ip not in network_ips:
+                            network_ips.append(ip)
+                finally:
+                    s.close()
+            except Exception:
+                pass
+        
+        # Try to get Windows network IP via PowerShell (from WSL)
+        try:
+            # Use powershell.exe directly (available in WSL)
+            result = subprocess.run(
+                ['powershell.exe', '-Command', 
+                 "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '172.21.*' -and $_.IPAddress -notlike '100.64.*'} | Select-Object -First 1 -ExpandProperty IPAddress).Trim()"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            if result.returncode == 0:
+                windows_ip = result.stdout.strip()
+                if windows_ip and windows_ip not in network_ips and len(windows_ip.split('.')) == 4:
+                    network_ips.append(windows_ip)
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        
+    except Exception as e:
+        logger.debug(f"Error detecting network IPs: {e}")
+    
+    return network_ips
+
+
+def log_server_addresses(host: str, port: int):
+    """Log server addresses that clients can use to connect."""
+    logger.info("=" * 60)
+    logger.info("SAM2 Mobile Server - Connection Information")
+    logger.info("=" * 60)
+    
+    # Localhost addresses
+    logger.info(f"Local access:")
+    logger.info(f"  http://127.0.0.1:{port}")
+    logger.info(f"  http://localhost:{port}")
+    
+    # WSL IP (if in WSL)
+    try:
+        wsl_ip = socket.gethostbyname(socket.gethostname())
+        if wsl_ip.startswith('172.21.'):
+            logger.info(f"WSL IP (Windows host only):")
+            logger.info(f"  http://{wsl_ip}:{port}")
+    except Exception:
+        pass
+    
+    # Network IPs (for other devices on same network)
+    network_ips = get_network_ips(port)
+    if network_ips:
+        logger.info(f"Network access (for other devices on same network):")
+        for ip in network_ips:
+            logger.info(f"  http://{ip}:{port}")
+    else:
+        logger.warning("Could not detect network IP. Other devices may not be able to connect.")
+        logger.info("  To find your network IP, run: ipconfig (Windows) or hostname -I (Linux)")
+    
+    logger.info("=" * 60)
+    logger.info("Note: Ensure port forwarding and firewall are configured if needed.")
+    logger.info("=" * 60)
+
+
 def main():
     global args
     args = parse_args()
@@ -878,6 +998,9 @@ def main():
     
     # Initialize predictor
     initialize_predictor(args)
+    
+    # Log server addresses
+    log_server_addresses(args.host, args.port)
     
     # Start Flask server
     logger.info(f"Starting SAM2 Mobile Server on {args.host}:{args.port}")

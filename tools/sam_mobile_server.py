@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import base64
+import gzip
 import io
 import json
 import logging
@@ -126,6 +127,17 @@ def parse_args() -> argparse.Namespace:
         default=0.6,
         help="Overlay opacity for masks in [0, 1] (default: 0.6).",
     )
+    parser.add_argument(
+        "--mask-downscale",
+        type=int,
+        default=2,
+        help="Downscale masks by this factor before encoding (1=no downscale, 2=half size, 4=quarter size). Higher = faster but lower resolution (default: 2).",
+    )
+    parser.add_argument(
+        "--no-mask-compress",
+        action="store_true",
+        help="Disable gzip compression of masks (faster encoding but larger payload).",
+    )
     return parser.parse_args()
 
 
@@ -222,6 +234,7 @@ def mask_logits_to_binary_masks(
     mask_logits: torch.Tensor,
     threshold: float = 0.5,
     frame_shape: Optional[Tuple[int, int]] = None,
+    downscale_factor: int = 1,
 ) -> List[Optional[np.ndarray]]:
     """Convert mask logits to binary masks (0/1 numpy arrays).
     
@@ -229,6 +242,7 @@ def mask_logits_to_binary_masks(
         mask_logits: Tensor of shape (num_obj, H, W) or similar
         threshold: Threshold for binarization
         frame_shape: Optional (height, width) to resize masks to match frame dimensions
+        downscale_factor: Downscale masks by this factor (1=no downscale, 2=half size, 4=quarter size)
     
     Returns:
         List of binary masks (numpy arrays of 0s and 1s), one per object
@@ -237,23 +251,39 @@ def mask_logits_to_binary_masks(
         return []
     
     try:
-        mask_probs = format_masks(mask_logits).detach().cpu().numpy()
-        binary_masks = []
+        # Process on GPU first, then move to CPU once
+        mask_probs = format_masks(mask_logits)
         
-        for i in range(mask_probs.shape[0]):
-            mask = mask_probs[i] > threshold
+        # Binarize on GPU (faster)
+        binary_tensor = (mask_probs > threshold).to(torch.uint8)
+        
+        # Calculate target shape with downscaling
+        if frame_shape is not None:
+            h, w = frame_shape
+            target_h = h // downscale_factor
+            target_w = w // downscale_factor
+        else:
+            # Use original mask dimensions if frame_shape not provided
+            target_h = binary_tensor.shape[1] // downscale_factor if downscale_factor > 1 else binary_tensor.shape[1]
+            target_w = binary_tensor.shape[2] // downscale_factor if downscale_factor > 1 else binary_tensor.shape[2]
+        
+        # Batch resize on GPU if possible, otherwise batch on CPU
+        binary_masks = []
+        for i in range(binary_tensor.shape[0]):
+            mask = binary_tensor[i].detach().cpu().numpy()
             
-            # Resize to frame shape if needed
+            # Resize if needed (batch resize would be faster but cv2 doesn't support it well)
             if frame_shape is not None:
                 h, w = frame_shape
-                if mask.shape[0] != h or mask.shape[1] != w:
+                if mask.shape[0] != target_h or mask.shape[1] != target_w:
+                    # Resize to downscaled target size
                     mask = cv2.resize(
-                        mask.astype(np.uint8),
-                        (w, h),
+                        mask,
+                        (target_w, target_h),
                         interpolation=cv2.INTER_NEAREST
-                    ).astype(bool)
+                    )
             
-            binary_masks.append(mask.astype(np.uint8))  # Convert to uint8 (0 or 1)
+            binary_masks.append(mask)
         
         return binary_masks
     except Exception as e:
@@ -261,22 +291,28 @@ def mask_logits_to_binary_masks(
         return []
 
 
-def encode_binary_mask(mask: Optional[np.ndarray]) -> Optional[str]:
+def encode_binary_mask(mask: Optional[np.ndarray], compress: bool = True) -> Optional[str]:
     """Encode binary mask to base64 string for JSON transmission.
     
     Args:
         mask: Binary mask as numpy array (0s and 1s) or None
+        compress: If True, compress mask with gzip before base64 encoding (much smaller)
     
     Returns:
-        Base64-encoded string of the mask data, or None if mask is None/empty
+        Base64-encoded string of the mask data (compressed if compress=True), or None if mask is None/empty
     """
     if mask is None:
         return None
     
     try:
-        # Flatten the mask and encode as base64
-        # The mask is already uint8 (0 or 1), so we can directly encode it
+        # Flatten the mask and encode
         mask_bytes = mask.tobytes()
+        
+        # Compress if requested (significantly reduces size for sparse masks)
+        if compress:
+            mask_bytes = gzip.compress(mask_bytes, compresslevel=1)  # Level 1 for speed
+        
+        # Base64 encode
         mask_encoded = base64.b64encode(mask_bytes).decode('utf-8')
         return mask_encoded
     except Exception as e:
@@ -578,13 +614,14 @@ def initialize_session():
             binary_masks = mask_logits_to_binary_masks(
                 combined_mask_logits,
                 threshold=args.mask_threshold,
-                frame_shape=(height, width)
+                frame_shape=(height, width),
+                downscale_factor=args.mask_downscale
             )
-            # Encode masks to base64
+            # Encode masks to base64 (with compression by default)
             encoded_masks = []
             for idx, obj_id in enumerate(initialized_obj_ids):
                 if idx < len(binary_masks):
-                    encoded_mask = encode_binary_mask(binary_masks[idx])
+                    encoded_mask = encode_binary_mask(binary_masks[idx], compress=not args.no_mask_compress)
                     encoded_masks.append(encoded_mask)
                 else:
                     encoded_masks.append(None)
@@ -701,7 +738,8 @@ def track_frame():
             binary_masks_list = mask_logits_to_binary_masks(
                 mask_logits,
                 threshold=args.mask_threshold,
-                frame_shape=frame_shape
+                frame_shape=frame_shape,
+                downscale_factor=args.mask_downscale
             )
         
         for original_obj_id in original_object_ids:
@@ -713,7 +751,7 @@ def track_frame():
                     result_object_ids.append(original_obj_id)
                     # Include mask if requested
                     if include_masks and idx < len(binary_masks_list):
-                        encoded_mask = encode_binary_mask(binary_masks_list[idx])
+                        encoded_mask = encode_binary_mask(binary_masks_list[idx], compress=not args.no_mask_compress)
                         result_masks.append(encoded_mask)
                     elif include_masks:
                         result_masks.append(None)
